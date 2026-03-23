@@ -4,6 +4,10 @@ This custom fork of TClient integrates a highly advanced, intelligent bot system
 
 ## Features
 
+*   **Reinforcement Learning (Trackmania Style)**: Transform the bot into a learning agent that explores and optimizes its own movement.
+    *   *Epsilon-Greedy Exploration*: Uses random noise in inputs to discover new shortcuts and movement techniques.
+    *   *Momentum Rewards*: Specifically tuned to reward maintaining velocity and aligning with the optimal path.
+    *   *Auto-Episode Reset*: Automatically kills and restarts the bot if it becomes stuck or fails to make progress, creating an autonomous training loop.
 *   **TAS Bot (Training & Playback)**: An AI capable of exploring maps, finding the optimal path to the finish line using an A* algorithm, and executing the run flawlessly.
     *   *Genetic Memory*: Learns from deaths and mistakes, penalizing hazardous areas.
     *   *Stuck Recovery*: Automatically detects when the bot is stuck and resets itself.

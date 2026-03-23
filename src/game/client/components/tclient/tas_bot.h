@@ -78,6 +78,9 @@ private:
 	// Optimization Settings: Pro-Level Brain
 	int m_NumCandidates = 64;   // Higher sampling for better hook discovery
 	int m_CandidateTicks = 15; // 0.25s lookahead
+	// Reinforcement Learning (Trackmania Style)
+	float m_Epsilon; // Exploration rate
+	int m_ConsecutiveDeadEnds;
 	CNetObj_PlayerInput m_LastBestInput;
 	int m_LastStrategy;
 	int m_StrategyTicks;

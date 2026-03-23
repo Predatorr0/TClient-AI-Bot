@@ -12,6 +12,9 @@ CTasBot::CTasBot()
 	m_IsTraining = false;
 	m_HasMasterRun = false;
 	m_pTasWorld = nullptr;
+	m_Epsilon = 0.5f; // Initial high exploration
+	m_ConsecutiveDeadEnds = 0;
+	m_StrategyTicks = 0;
 	m_PlaybackTick = 0;
 	m_StuckTicks = 0;
 	m_LastStuckPos = vec2(0, 0);
@@ -296,6 +299,11 @@ float CTasBot::EvaluateState(const CCandidatePath& Cand, const CCharacterCore& S
 
 	float Score = 0.0f;
 	vec2 FinalPos = Cand.m_FinalCore.m_Pos;
+	
+	// Trackmania RL: Extract core metrics
+	float VelLen = length(Cand.m_FinalCore.m_Vel);
+	vec2 VelDir = vec2(0,0);
+	if(VelLen > 0.001f) VelDir = normalize(Cand.m_FinalCore.m_Vel);
 
 	// 1. PATH PROGRESS REWARD
 	if(!m_AStarPath.empty() && m_AStarPath.size() < 1000000) // Sanity check on path size
@@ -318,26 +326,68 @@ float CTasBot::EvaluateState(const CCandidatePath& Cand, const CCharacterCore& S
 			Score -= (StartIdx - EndIdx) * 20.0f;
 			
 		Score -= MinEnd * 2.0f; // Stay close to path
+
+		// Momentum Reward: Bonus if velocity is aligned with the A* path direction
+		if(EndIdx != -1 && EndIdx < (int)m_AStarPath.size() - 1)
+		{
+			vec2 PathDir = vec2(0,0);
+			float PathLen = distance(m_AStarPath[EndIdx+1], m_AStarPath[EndIdx]);
+			if(PathLen > 0.001f) PathDir = normalize(m_AStarPath[EndIdx+1] - m_AStarPath[EndIdx]);
+			
+			float Alignment = dot(VelDir, PathDir);
+			if(Alignment > 0.5f) Score += Alignment * VelLen * 5.0f; 
+		}
 	}
 	
-	// 2. SPEED & MOMENTUM
-	float VelLen = length(Cand.m_FinalCore.m_Vel);
-	Score += VelLen * 2.0f;
+	// 2. SPEED BONUS (Trackmania Style)
+	Score += VelLen * 3.0f;
+	
+	// Momentum Reward: (Moved inside path block)
+
+	// IDLING PENALTY: Force the bot to move!
+	if(VelLen < 0.2f)
+	{
+		Score -= 1000.0f; // Massive penalty for standing still or being stuck
+	}
 
 	// 3. ENTITY REWARDS (Modular)
 	if(g_Config.m_TcBotDDRaceAware && m_pTasWorld)
 	{
 		if(m_pTasWorld->ReachedFinish())
 			Score += 10000.0f; // VICTORY!
+			
+		if(m_pTasWorld->IsFrozen())
+			Score -= 5000.0f; // FREEZE IS ALMOST DEATH
 	}
 	
-	// 4. WALL REPULSION
+	// 4. WALL & FREEZE REPULSION (Proactive Steering)
 	CCollision *pCollision = GameClient()->Collision();
-	if(pCollision && (pCollision->IsSolid(FinalPos.x + 18, FinalPos.y) || 
-	   pCollision->IsSolid(FinalPos.x - 18, FinalPos.y) ||
-	   pCollision->IsSolid(FinalPos.x, FinalPos.y + 18)))
+	if(pCollision)
 	{
-		Score -= 100.0f; 
+		bool NearWall = pCollision->IsSolid(FinalPos.x + 18, FinalPos.y) || 
+		                pCollision->IsSolid(FinalPos.x - 18, FinalPos.y) ||
+		                pCollision->IsSolid(FinalPos.x, FinalPos.y + 18) ||
+		                pCollision->IsSolid(FinalPos.x, FinalPos.y - 18);
+		
+		if(NearWall) Score -= 100.0f;
+		
+		// Proactive Freeze Avoidance: Check tiles in a small cross pattern around the bot
+		bool NearFreeze = false;
+		for(int ox = -40; ox <= 40; ox += 20)
+		{
+			for(int oy = -40; oy <= 40; oy += 20)
+			{
+				int Tile = pCollision->GetCollisionAt(FinalPos.x + ox, FinalPos.y + oy);
+				if(Tile == TILE_FREEZE || Tile == TILE_DFREEZE || Tile == TILE_LFREEZE)
+				{
+					NearFreeze = true;
+					break;
+				}
+			}
+			if(NearFreeze) break;
+		}
+		
+		if(NearFreeze) Score -= 800.0f; // Strong repulsion to stay away from freeze
 	}
 
 	// 5. JITTER PREVENTION
@@ -369,51 +419,23 @@ CNetObj_PlayerInput CTasBot::GetBestLiveInput(const CCharacterCore& CurrentCore)
 	
 	std::vector<CCandidatePath> Candidates;
 	
-	// Genetic Algorithm: Mutation of the previous best candidate
-	// 1. ELITE: Previous best sequence (shifted by 1 tick)
-	if(!m_BestCandidate.m_Inputs.empty())
-	{
-		CCandidatePath Elite = m_BestCandidate;
-		Elite.m_Inputs.erase(Elite.m_Inputs.begin());
-		Elite.m_Inputs.push_back(GetNextExplorationInput(false, CurrentCore.m_Pos));
-		Candidates.push_back(Elite);
-		
-		// 2. MUTANTS: 16 modified versions of the elite
-		for(int i = 0; i < 16; i++)
-		{
-			CCandidatePath Mutant = Elite;
-			// Randomly mutate 1-3 inputs in the sequence
-			int Mutations = 1 + (rand() % 3);
-			for(int m = 0; m < Mutations; m++)
-			{
-				int RandTick = rand() % Mutant.m_Inputs.size();
-				Mutant.m_Inputs[RandTick] = GetNextExplorationInput(false, CurrentCore.m_Pos);
-			}
-			Candidates.push_back(Mutant);
-		}
-	}
+	// SENSORS: Check surroundings for hookable walls
+	vec2 HookTarget = vec2(0,0);
+	if(g_Config.m_TcBotDDRaceAware)
+		HookTarget = FindBestHookTarget(CurrentCore.m_Pos, 400.0f);
 
-	// 3. RANDOM EXPLORERS: Fill remaining slots with new random paths
-	while((int)Candidates.size() < m_NumCandidates)
+	// 1. EXPLORATION (Epsilon-Greedy): Occasionally replace most candidates with random mutations
+	bool UseElite = (((rand() % 1000) / 1000.0f) > m_Epsilon);
+
+	for(int i = 0; i < m_NumCandidates; i++)
 	{
-		CCandidatePath RandCand;
-		RandCand.m_IsDead = false;
-		for(int t = 0; t < m_CandidateTicks; t++)
-		{
-			RandCand.m_Inputs.push_back(GetNextExplorationInput(false, CurrentCore.m_Pos));
-		}
-		Candidates.push_back(RandCand);
-	}
-	
-	// Simulate all candidates
-	int c = 0;
-	for(auto& Cand : Candidates)
-	{
-		m_pTasWorld->LoadFromCurrentCore(CurrentCore);
+		CCandidatePath Cand;
 		
-		int Strategy = c % 12;
-		c++;
-		vec2 HookTarget = FindBestHookTarget(CurrentCore.m_Pos, 600.0f);
+		// STRATEGY ASSIGNMENT
+		// i=0: Random Explorer (Pure Noise)
+		// i=1: Elite Follower (if exists)
+		// i=2-10: Strategic Specialists
+		int Strategy = i % 12;
 
 		for(int t = 0; t < m_CandidateTicks; t++)
 		{
@@ -421,18 +443,13 @@ CNetObj_PlayerInput CTasBot::GetBestLiveInput(const CCharacterCore& CurrentCore)
 			Inp.m_TargetY = -100;
 			Inp.m_TargetX = (rand() % 400) - 200;
 
-			if(Strategy == 9 && HookTarget != vec2(0,0)) {
-				// Pro Strategy: Aim for the best hookable tile
-				Inp.m_TargetX = (int)(HookTarget.x - CurrentCore.m_Pos.x);
-				Inp.m_TargetY = (int)(HookTarget.y - CurrentCore.m_Pos.y);
-				Inp.m_Hook = 1;
+			// Random Exploration Strategy
+			if(!UseElite || Strategy == 0)
+			{
+				Inp.m_Direction = (rand() % 3) - 1;
+				Inp.m_Jump = (rand() % 2);
+				Inp.m_Hook = (rand() % 2);
 			}
-			else if(Strategy == 0) Inp.m_Direction = 1;
-			else if(Strategy == 1) Inp.m_Direction = -1;
-			else if(Strategy == 2) { Inp.m_Direction = 1; Inp.m_Jump = 1; }
-			else if(Strategy == 3) { Inp.m_Direction = -1; Inp.m_Jump = 1; }
-			else if(Strategy == 4) { Inp.m_Direction = 1; Inp.m_Hook = 1; }
-			else if(Strategy == 5) { Inp.m_Direction = -1; Inp.m_Hook = 1; }
 			else if(Strategy == 6) { Inp.m_Hook = 1; }
 			else if(Strategy == 7) { Inp.m_Jump = 1; }
 			else if(Strategy == 8) { Inp.m_Direction = (rand()%3)-1; Inp.m_Hook = (rand()%2); }
@@ -680,8 +697,39 @@ void CTasBot::OnUpdate()
 	if(!GameClient()->Collision() || GameClient()->m_Snap.m_LocalClientId < 0)
 		return;
 
-	// Sync training state with config
-	if(g_Config.m_ClTasTraining && !m_IsTraining)
+	// === MUTUAL EXCLUSION: Training and Playback cannot run at the same time ===
+	if(g_Config.m_ClTasTraining && g_Config.m_ClTasPlayback)
+	{
+		g_Config.m_ClTasPlayback = 0; // Training takes priority
+		m_PlaybackTick = 0;
+		dbg_msg("tas_bot", "CONFLICT: Disabling Playback Mode because Training Mode is active.");
+	}
+
+	// === EPISODE RESET: Automatically kill if stuck or no path progress ===
+	if(m_IsTraining)
+	{
+		static int s_NoProgressTicks = 0;
+		CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
+		
+		if(pLocalChar)
+		{
+			// Check if we are stuck or moving too slowly for too long
+			if(length(pLocalChar->GetCore().m_Vel) < 0.2f)
+				s_NoProgressTicks++;
+			else
+				s_NoProgressTicks = 0;
+				
+			if(s_NoProgressTicks > 50 * 5) // 5 seconds of no movement
+			{
+				dbg_msg("tas_bot", "STUCK: Resetting episode (Kill).");
+				GameClient()->Console()->ExecuteLine("kill", IConsole::CLIENT_ID_GAME);
+				s_NoProgressTicks = 0;
+				m_ConsecutiveDeadEnds++;
+			}
+		}
+	}
+
+	if(g_Config.m_ClTasTraining)
 		StartTraining();
 	else if(!g_Config.m_ClTasTraining && m_IsTraining)
 		StopTraining();
