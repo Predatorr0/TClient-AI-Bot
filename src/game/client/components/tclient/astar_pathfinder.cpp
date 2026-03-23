@@ -48,22 +48,18 @@ bool CAStarPathfinder::IsWalkable(int X, int Y) const
 	if(!m_pCollision) return false;
 	if(X < 0 || X >= m_Width || Y < 0 || Y >= m_Height) return false;
 
-	// Check if the center is solid
-	if(m_pCollision->IsSolid(X * 32 + 16, Y * 32 + 16))
-		return false;
-
-	// Check for danger (Freeze, Death, etc)
-	if(IsDangerous(X, Y))
-		return false;
-
-	// Character radius safety: Check 4 corners of the character (approx 14 units radius)
-	// We check if any of these corners hit a solid wall
-	int px = X * 32 + 16;
-	int py = Y * 32 + 16;
-	const int r = 14;
-	if(m_pCollision->IsSolid(px - r, py - r) || m_pCollision->IsSolid(px + r, py - r) ||
-	   m_pCollision->IsSolid(px - r, py + r) || m_pCollision->IsSolid(px + r, py + r))
-		return false;
+	// Phase 7: 2x2 Tile Clearance (Hitbox Safety)
+	// Tee is approx 28x28, checking 3 points per side + center
+	for(int ay = 0; ay < 2; ay++)
+	{
+		for(int ax = 0; ax < 2; ax++)
+		{
+			int px = X * 32 + ax * 31; // Check corners of a 2x2 area
+			int py = Y * 32 + ay * 31;
+			if(m_pCollision->IsSolid(px, py)) return false;
+			if(IsDangerous(px / 32, py / 32)) return false;
+		}
+	}
 
 	return true;
 }
@@ -146,11 +142,27 @@ std::vector<vec2> CAStarPathfinder::FindPath(vec2 StartPos, vec2 GoalPos)
 			if(ClosedList[nIdx] || !IsWalkable(nx, ny))
 				continue;
 
-			// Diagonals cost more (sqrt(2) approx 1.414)
+			// Phase 7: Physics-Aware Costing (Gravity & Hook Bias)
 			float MoveCost = (i < 4) ? 1.0f : 1.414f;
 			
-			// Add penalty if falling freely without ground below (encourage jumping/hooking properly? 
-			// A* doesn't know physics, so we just stick to generic shortest-path).
+			// Gravity Bias: Moving UP (ny < Current.m_Y) is harder
+			if(ny < Current.m_Y)
+			{
+				bool HookableAbove = false;
+				for(int ay = -1; ay >= -4; ay--) // Look up for hookable ceiling
+				{
+					if(m_pCollision->IsSolid(nx * 32 + 16, (ny + ay) * 32 + 16)) {
+						HookableAbove = true;
+						break;
+					}
+				}
+				if(!HookableAbove) MoveCost *= 10.0f; // Massive penalty for floating up
+			}
+			else if(ny > Current.m_Y)
+			{
+				MoveCost *= 0.8f; // Fall discount
+			}
+
 			float NewG = Current.m_G + MoveCost;
 
 			if(AllNodes.find(nIdx) == AllNodes.end() || NewG < AllNodes[nIdx].m_G)
@@ -192,12 +204,35 @@ std::vector<vec2> CAStarPathfinder::FindPath(vec2 StartPos, vec2 GoalPos)
 			cy = py;
 		}
 		std::reverse(Path.begin(), Path.end());
-	}
-	else
-	{
-		// Log why it failed (this will be visible in the console if called from CTasBot)
-		// Note: CAStarPathfinder doesn't have its own console access, so CTasBot will log Path.empty()
+		SmoothPath(Path); // Clean up zigzags
 	}
 
 	return Path;
+}
+
+void CAStarPathfinder::SmoothPath(std::vector<vec2>& Path)
+{
+	if(Path.size() < 3) return;
+
+	std::vector<vec2> Smoothed;
+	Smoothed.push_back(Path[0]);
+
+	size_t Current = 0;
+	while(Current < Path.size() - 1)
+	{
+		size_t Next = Current + 1;
+		// Look as far ahead as possible for LOS
+		for(size_t i = Current + 2; i < Path.size(); i++)
+		{
+			vec2 Hit;
+			if(!m_pCollision->IntersectLine(Path[Current], Path[i], &Hit, nullptr))
+			{
+				Next = i;
+			}
+			else break;
+		}
+		Smoothed.push_back(Path[Next]);
+		Current = Next;
+	}
+	Path = Smoothed;
 }

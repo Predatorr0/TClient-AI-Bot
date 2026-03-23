@@ -15,6 +15,22 @@ class CPlayers : public CComponent
 	void RenderHand7(const CTeeRenderInfo *pInfo, vec2 HandPos, float HandAngle, float Alpha);
 
 	void RenderHand(const CTeeRenderInfo *pInfo, vec2 CenterPos, vec2 Dir, float AngleOffset, vec2 PostRotOffset, float Alpha);
+	void RenderHookCollLine(
+		const CNetObj_Character *pPrevChar,
+		const CNetObj_Character *pPlayerChar,
+		int ClientId);
+	bool IsPlayerInfoAvailable(int ClientId) const;
+
+	int m_WeaponEmoteQuadContainerIndex;
+	int m_aWeaponSpriteMuzzleQuadContainerIndex[NUM_WEAPONS];
+
+	void CreateNinjaTeeRenderInfo();
+	void CreateSpectatorTeeRenderInfo();
+
+	std::shared_ptr<CManagedTeeRenderInfo> m_pNinjaTeeRenderInfo;
+	std::shared_ptr<CManagedTeeRenderInfo> m_pSpectatorTeeRenderInfo;
+
+public:
 	void RenderPlayer(
 		const CNetObj_Character *pPrevChar,
 		const CNetObj_Character *pPlayerChar,
@@ -34,22 +50,7 @@ class CPlayers : public CComponent
 		const CTeeRenderInfo *pRenderInfo,
 		int ClientId,
 		float Intra = 0.f);
-	void RenderHookCollLine(
-		const CNetObj_Character *pPrevChar,
-		const CNetObj_Character *pPlayerChar,
-		int ClientId);
-	bool IsPlayerInfoAvailable(int ClientId) const;
 
-	int m_WeaponEmoteQuadContainerIndex;
-	int m_aWeaponSpriteMuzzleQuadContainerIndex[NUM_WEAPONS];
-
-	void CreateNinjaTeeRenderInfo();
-	void CreateSpectatorTeeRenderInfo();
-
-	std::shared_ptr<CManagedTeeRenderInfo> m_pNinjaTeeRenderInfo;
-	std::shared_ptr<CManagedTeeRenderInfo> m_pSpectatorTeeRenderInfo;
-
-public:
 	float GetPlayerTargetAngle(
 		const CNetObj_Character *pPrevChar,
 		const CNetObj_Character *pPlayerChar,

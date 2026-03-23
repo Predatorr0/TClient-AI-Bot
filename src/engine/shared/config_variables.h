@@ -784,6 +784,9 @@ MACRO_CONFIG_INT(GfxDriverIsBlocked, gfx_driver_is_blocked, 0, 0, 1, CFGFLAG_SAV
 MACRO_CONFIG_INT(ClVideoRecorderFPS, cl_video_recorder_fps, 60, 1, 1000, CFGFLAG_SAVE | CFGFLAG_CLIENT, "At which FPS the videorecorder should record demos.")
 MACRO_CONFIG_INT(ClTasTraining, cl_tas_training, 0, 0, 1, CFGFLAG_CLIENT, "Enable TAS Bot training")
 MACRO_CONFIG_INT(ClTasPlayback, cl_tas_playback, 0, 0, 1, CFGFLAG_CLIENT, "Enable TAS Bot playback")
+MACRO_CONFIG_INT(ClTasHyperTrain, cl_tas_hyper_train, 0, 0, 1, CFGFLAG_CLIENT, "Enable TAS Bot Hyper-Simulation (High Speed)")
+MACRO_CONFIG_INT(ClTasBotInception, cl_tas_bot_inception, 0, 0, 1, CFGFLAG_CLIENT, "Enable TAS Bot Inception (Local Hyper-Simulation)")
+MACRO_CONFIG_INT(ClTasBotInceptionSpeed, cl_tas_bot_inception_speed, 50, 1, 200, CFGFLAG_CLIENT, "Inception Simulation Speed (ticks per frame)")
 MACRO_CONFIG_INT(ClTasSpeedrun, cl_tas_speedrun, 0, 0, 1, CFGFLAG_CLIENT, "Enable TAS Bot speedrun mode (faster movement, optimal hooks)")
 
 

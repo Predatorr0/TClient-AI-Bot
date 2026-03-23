@@ -13,6 +13,7 @@ public:
 
 	// Returns a list of REAL WORLD coordinates forming the path from Start to Goal
 	std::vector<vec2> FindPath(vec2 StartPos, vec2 GoalPos);
+	void SmoothPath(std::vector<vec2>& Path);
 
 private:
 	bool IsWalkable(int X, int Y) const;

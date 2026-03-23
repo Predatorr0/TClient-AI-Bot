@@ -140,6 +140,9 @@ public:
 	// TClient
 	CNetObj_PlayerInput *LatestInput() { return &m_LatestInput; }
 
+	// the player core for the physics - made public for TAS Bot Phase 8
+	CCharacterCore m_Core;
+
 private:
 	// weapon info
 	int m_aHitObjects[MAX_CLIENTS];
@@ -169,9 +172,6 @@ private:
 	// tune
 	int m_TuneZone;
 	int m_TuneZoneOverride;
-
-	// the player core for the physics
-	CCharacterCore m_Core;
 
 	// DDRace
 

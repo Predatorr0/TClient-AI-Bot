@@ -3,11 +3,17 @@
 
 #include <game/client/component.h>
 #include <vector>
+#include <map>
+#include <cstdint>
+#include <array>
 #include <generated/protocol.h>
 #include <game/client/prediction/entities/character.h>
 #include <base/system.h>
 #include <base/vmath.h>
 #include "tas_world.h"
+
+class CTasWorld;
+class CAStarPathfinder;
 
 class CTasBot : public CComponent
 {
@@ -53,6 +59,7 @@ private:
 	bool m_HasMasterRun;
 	
 	CTasWorld *m_pTasWorld;
+	CAStarPathfinder *m_pPathfinder;
 	CCharacterCore m_StartCore;
 
 	// The sequence of inputs we are currently exploring
@@ -95,6 +102,49 @@ private:
 	CCandidatePath m_BestCandidate;
 
 	int m_PrevAvoidFreeze;
+
+	// Frame-Hold & Q-Learning (Trackmania Refactor)
+	int m_ActionHoldFrames;     // How many frames to stick with current action
+	int m_CurrentAction;        // Active discrete action index
+	uint64_t m_LastStateHash;   // Hash of the previous state
+	
+	// Simple Q-Table: StateHash -> Fixed Array of Action Values
+	std::map<uint64_t, std::array<float, 8>> m_QTable;
+	
+	// Sliding Window Collision Detection & Redirect State
+	vec2 m_PosHistory[5];
+	int m_PosHistoryIdx;
+	int m_BannedAction;
+	int m_BannedActionTicks;
+	int m_ActionHoldElapsed; // To ensure we only check collision after ~5 frames of holding
+	float m_LastDist;
+	vec2 m_LastUpdatePos;
+	uint64_t m_StuckCounter;
+	
+	uint64_t GetStateHash(const CCharacterCore& Core, vec2 DynamicWaypoint);
+	vec2 GetDynamicWaypoint(vec2 BotPos);
+	vec2 FindBestHookTarget(vec2 BotPos, vec2 TargetDir, float Radius);
+	CNetObj_PlayerInput MapActionToInput(int Action, const CCharacterCore& Core, vec2 DynamicWaypoint);
+	void UpdateQValue(uint64_t State, int Action, float Reward, uint64_t NextState);
+	void SaveMemory();
+	void LoadMemory();
+	
+	int m_LastUpdateTick; // Temporal Guard: For OnUpdate reward/stuck
+	int m_LastAITick;     // Gemini Pro 50Hz Master Lock
+	int m_LastRecalculateTick; // GPS Fix timer
+	bool m_HyperSimulationActive; // RCON Speed status
+	CNetObj_PlayerInput m_LastInput; // Cached decision
+	float m_PreviousHorizontalVel;  // For Tarzan Reward
+	
+	// Phase 8: Inception (Local TAS World)
+	CCharacterCore m_SimulatedCore;
+	CWorldCore m_SimulatedWorld;
+	bool m_InceptionActive;
+	vec2 m_InceptionResetPos;
+
+	void RunInceptionTick();
+	void RenderInceptionGhost();
+	void ResetInception();
 };
 
 #endif

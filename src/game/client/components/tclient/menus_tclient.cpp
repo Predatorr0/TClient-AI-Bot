@@ -1130,6 +1130,16 @@ void CMenus::RenderSettingsTClientSettings(CUIRect MainView)
 	DoButton_CheckBoxAutoVMarginAndSet(&g_Config.m_ClTasPlayback, TCLocalize("Playback Mode (Execute Run)"), &g_Config.m_ClTasPlayback, &Column, LineSize);
 	DoButton_CheckBoxAutoVMarginAndSet(&g_Config.m_ClTasSpeedrun, TCLocalize("Speedrun Optimization"), &g_Config.m_ClTasSpeedrun, &Column, LineSize);
 
+	// Phase 8: Inception Controls
+	DoButton_CheckBoxAutoVMarginAndSet(&g_Config.m_ClTasBotInception, TCLocalize("Inception Mode (Dream World)"), &g_Config.m_ClTasBotInception, &Column, LineSize);
+	if (g_Config.m_ClTasBotInception)
+	{
+		Column.HSplitTop(LineSize, &Button, &Column);
+		Ui()->DoScrollbarOption(&g_Config.m_ClTasBotInceptionSpeed, &g_Config.m_ClTasBotInceptionSpeed, &Button, TCLocalize("Inception Speed"), 1, 200, &CUi::ms_LinearScrollbarScale, 0, "x");
+	}
+
+	DoButton_CheckBoxAutoVMarginAndSet(&g_Config.m_ClTasHyperTrain, TCLocalize("Hyper-Simulation (Live Speedup)"), &g_Config.m_ClTasHyperTrain, &Column, LineSize);
+
 	Column.HSplitTop(LineSize, &Button, &Column);
 	if(this->GameClient()->m_TasBot.HasMasterRun())
 	{

@@ -305,6 +305,8 @@ MACRO_CONFIG_INT(TcBotAutoReset, tc_bot_auto_reset, 1, 0, 1, CFGFLAG_CLIENT | CF
 MACRO_CONFIG_INT(TcBotSynergy, tc_bot_synergy, 1, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Automatically toggle Avoid-Freeze during AI training")
 MACRO_CONFIG_INT(TcBotDDRaceAware, tc_bot_ddrace_aware, 1, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Enable DDRace entity awareness in AI pathing/evaluation")
 
+MACRO_CONFIG_INT(TcTasBotAutoKill, tc_tas_bot_auto_kill, 1, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Enable/Disable automatic suicide when stuck")
+
 // Client Spoofer
 MACRO_CONFIG_INT(TcSpoofer, tc_spoofer, 0, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Spoof client identity to server (0=off, 1=on)")
 MACRO_CONFIG_INT(TcSpooferClient, tc_spoofer_client, 0, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Client to spoof as (0=DDNet, 1=TClient)")
