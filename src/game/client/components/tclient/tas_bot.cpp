@@ -445,8 +445,9 @@ CNetObj_PlayerInput CTasBot::MapActionToInput(int Action, const CCharacterCore& 
 CTasBot::SOracleTrajectory CTasBot::VerifyTrajectoryPrior(const STasActionSequence& PriorSequence)
 {
 	SOracleTrajectory Result;
-	Result.m_IsPhysicallyValid = true;
+	Result.m_Fatal = false;
 	Result.m_SurvivalTicks = 0;
+	Result.m_RiskGradient = 0.0f;
 
 	// 1. THE SINGULARITY CLONE
 	CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
@@ -464,19 +465,32 @@ CTasBot::SOracleTrajectory CTasBot::VerifyTrajectoryPrior(const STasActionSequen
 		SimCore.Tick(true); 
 		SimCore.Move();
 
-		// 3. GEOMETRY VERIFICATION
+		// Phase 68: Risk-Jacobian Threat Sonar
+		float DistToDeath = 800.0f;
+		for(int ox = -1; ox <= 1; ++ox) {
+			for(int oy = -1; oy <= 1; ++oy) {
+				int tx = round_to_int(SimCore.m_Pos.x)/32 + ox;
+				int ty = round_to_int(SimCore.m_Pos.y)/32 + oy;
+				int Tile = pCollision->GetTile(tx, ty);
+				if(Tile == TILE_DEATH || Tile == TILE_FREEZE) {
+					float d = distance(SimCore.m_Pos, vec2(tx*32+16, ty*32+16));
+					if(d < DistToDeath) DistToDeath = d;
+				}
+			}
+		}
+		Result.m_RiskGradient = 1.0f / (DistToDeath + 0.1f);
+
+		// 3. GEOMETRY VERIFICATION (Sovereign Pruning)
 		int TileIndex = pCollision->GetTile(round_to_int(SimCore.m_Pos.x) / 32, round_to_int(SimCore.m_Pos.y) / 32);
 
 		if(TileIndex == TILE_DEATH || TileIndex == TILE_FREEZE) 
 		{
-			Result.m_IsPhysicallyValid = false;
+			Result.m_Fatal = true;
 			break; 
 		}
 		Result.m_SurvivalTicks++;
 	}
-
-	Result.m_EndPos = SimCore.m_Pos;
-	Result.m_EndVel = SimCore.m_Vel;
+	
 	return Result;
 }
 
@@ -1190,13 +1204,54 @@ void CTasBot::OnUpdate()
 	if (!pLocalChar) return;
 	CCharacterCore CurrentCore = pLocalChar->GetCore();
 
+	// Phase 68: Risk-Jacobian Threat Sonar (Euclidean Gradient)
+	m_RiskGradient = 0.0f;
+	{
+		CCollision *pColl = GameClient()->Collision();
+		int px = round_to_int(CurrentCore.m_Pos.x) / 32;
+		int py = round_to_int(CurrentCore.m_Pos.y) / 32;
+		float min_dist_sq = 1000000.0f;
+		for(int y = -2; y <= 2; y++) {
+			for(int x = -2; x <= 2; x++) {
+				int tile = pColl->GetTile(px + x, py + y);
+				if(tile == TILE_DEATH || tile == TILE_FREEZE) {
+					float dx = (float)x * 32.0f;
+					float dy = (float)y * 32.0f;
+					float d2 = dx*dx + dy*dy;
+					if(d2 < min_dist_sq) min_dist_sq = d2;
+				}
+			}
+		}
+		m_RiskGradient = 1.0f / (1.0f + sqrt(min_dist_sq)); // Continuous 0-1 Risk Signal
+	}
+
 	// Phase 62: LPSD (Latent Phase-Space Diffusion) State Sync
 	if (m_LPSDActive && m_pDiffusionManifold) {
+		// Phase 68: Sovereign Sync (Seqlock Start) 🏺
+		uint32_t seq = m_pDiffusionManifold->sequence_counter.load(std::memory_order_relaxed);
+		m_pDiffusionManifold->sequence_counter.store(seq | 1, std::memory_order_release);
+		
+		std::atomic_thread_fence(std::memory_order_acquire); // Force flush from Cache to RAM
+
 		m_pDiffusionManifold->current_pos_x = CurrentCore.m_Pos.x;
 		m_pDiffusionManifold->current_pos_y = CurrentCore.m_Pos.y;
 		m_pDiffusionManifold->current_vel_x = CurrentCore.m_Vel.x;
 		m_pDiffusionManifold->current_vel_y = CurrentCore.m_Vel.y;
-		m_pDiffusionManifold->current_tick_index++; // Heatbeat for Python Denoising
+		
+		// Phase 68: Phantom Tether (Shadow-State Projection)
+		const CNetObj_PlayerInfo *pInfo = GameClient()->m_Snap.m_apPlayerInfos[GameClient()->m_Snap.m_LocalClientId];
+		float LatencyInSeconds = (pInfo ? pInfo->m_Latency : 0) / 1000.0f;
+		m_pDiffusionManifold->shadow_pos_x = CurrentCore.m_Pos.x + (CurrentCore.m_Vel.x * LatencyInSeconds);
+		m_pDiffusionManifold->shadow_pos_y = CurrentCore.m_Pos.y + (CurrentCore.m_Vel.y * LatencyInSeconds);
+		
+		// Phase 68: Risk-Jacobian Threat Sonar
+		m_pDiffusionManifold->risk_jacobian = m_RiskGradient; // Set earlier in loop or via sonar
+
+		m_pDiffusionManifold->current_tick_index++; // Heartbeat for Python Denoising
+		
+		std::atomic_thread_fence(std::memory_order_release);
+		// Sovereign Sync (Seqlock End) - Mark as Valid
+		m_pDiffusionManifold->sequence_counter.store((seq | 1) + 1, std::memory_order_release);
 
 		// If LPSD playback is active, intercept control
 		if (g_Config.m_ClTasPlayback == 2) { // Mode 2 = LPSD Direct Manifold

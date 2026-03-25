@@ -4,6 +4,7 @@
 
 #include <deque>
 #include <map>
+#include <atomic>
 #include <vector>
 #include <string>
 #include <fstream>
@@ -150,6 +151,8 @@ class CTasBot : public CComponent
 	
 	float m_ExplorationBoost = 1.0f;
 	void UpdateTapMatrix(vec2 Pos, vec2 Vel, float Trauma);
+	bool m_LPSDActive;
+	float m_RiskGradient; // Phase 68: Risk-Jacobian Threat Sonar
 	void ExportNeuralState(float Reward);
 	float GetTraumaIntensity(vec2 Pos);
 
@@ -171,16 +174,19 @@ class CTasBot : public CComponent
 	};
 
 	struct SOracleTrajectory {
-		vec2 m_EndPos;
-		vec2 m_EndVel;
-		bool m_IsPhysicallyValid;
+		bool m_Fatal;
 		int m_SurvivalTicks;
+		float m_RiskGradient; // Phase 68: Hazard Proximity Sonar
+		int m_TemporalIndex; // Added Temporal Index
 	};
 
 	SOracleTrajectory VerifyTrajectoryPrior(const STasActionSequence& PriorSequence);
 
-	// Phase 62: Latent Phase-Space Diffusion (LPSD) 🌌
+	// Phase 68: Sovereign Sync Protocol (Seqlock) 🏺
+#pragma pack(push, 1)
 	struct DiffusionBrain {
+		std::atomic<uint32_t> sequence_counter; // Phase 68: Atomic Sequence Lock
+		
 		// Python writes the hallucinated trajectory (100 ticks ahead)
 		int predicted_actions[100]; 
 		float predicted_target_x[100];
@@ -189,13 +195,16 @@ class CTasBot : public CComponent
 		// C++ reports actual state for next denoising pass
 		float current_pos_x, current_pos_y;
 		float current_vel_x, current_vel_y;
-		int current_tick_index;
+		float shadow_pos_x, shadow_pos_y; // Phantom Tether
+		float risk_jacobian;             // Edge-Loss Gradient
 		
+		int current_tick_index;
+		int m_TemporalIndex;
 		int read_buffer_index; 
 	};
+#pragma pack(pop)
 
 	DiffusionBrain* m_pDiffusionManifold;
-	bool m_LPSDActive;
 
 	// Phase 61.1: Hierarchical Objective Fusion (H-OF) [LEGACY-READY]
 	struct RewardVector {

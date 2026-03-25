@@ -1,0 +1,25 @@
+
+--- Integration Start: Tue Mar 24 18:47:02 2026 ---
+[1/4] Generating src/generated/checksum.cpp
+[2/4] Building CXX object CMakeFiles/game-client.dir/src/generated/checksum.cpp.obj
+[3/4] Building CXX object CMakeFiles/game-client.dir/src/game/client/components/tclient/tas_bot.cpp.obj
+C:/Users/ataka/Downloads/tclient/2 client/TClient-master/src/game/client/components/tclient/tas_bot.cpp: In member function 'void CTasBot::OnBeforeInput(CNetObj_PlayerInput*)':
+C:/Users/ataka/Downloads/tclient/2 client/TClient-master/src/game/client/components/tclient/tas_bot.cpp:1552:29: warning: declaration of 'pLocalChar' shadows a previous local [-Wshadow]
+ 1552 |                 CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
+      |                             ^~~~~~~~~~
+C:/Users/ataka/Downloads/tclient/2 client/TClient-master/src/game/client/components/tclient/tas_bot.cpp:1521:21: note: shadowed declaration is here
+ 1521 |         CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
+      |                     ^~~~~~~~~~
+C:/Users/ataka/Downloads/tclient/2 client/TClient-master/src/game/client/components/tclient/tas_bot.cpp:1572:29: warning: declaration of 'pLocalChar' shadows a previous local [-Wshadow]
+ 1572 |                 CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
+      |                             ^~~~~~~~~~
+C:/Users/ataka/Downloads/tclient/2 client/TClient-master/src/game/client/components/tclient/tas_bot.cpp:1521:21: note: shadowed declaration is here
+ 1521 |         CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
+      |                     ^~~~~~~~~~
+C:/Users/ataka/Downloads/tclient/2 client/TClient-master/src/game/client/components/tclient/tas_bot.cpp:1636:37: warning: declaration of 'pLocalChar' shadows a previous local [-Wshadow]
+ 1636 |                         CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
+      |                                     ^~~~~~~~~~
+C:/Users/ataka/Downloads/tclient/2 client/TClient-master/src/game/client/components/tclient/tas_bot.cpp:1521:21: note: shadowed declaration is here
+ 1521 |         CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
+      |                     ^~~~~~~~~~
+[4/4] Linking CXX executable DDNet.exe

@@ -1135,8 +1135,10 @@ void CMenus::RenderSettingsTClientSettings(CUIRect MainView)
 	if (g_Config.m_ClTasBotInception)
 	{
 		Column.HSplitTop(LineSize, &Button, &Column);
-		Ui()->DoScrollbarOption(&g_Config.m_ClTasBotInceptionSpeed, &g_Config.m_ClTasBotInceptionSpeed, &Button, TCLocalize("Inception Speed"), 1, 200, &CUi::ms_LinearScrollbarScale, 0, "x");
+		Ui()->DoScrollbarOption(&g_Config.m_TcTasInceptionSpeed, &g_Config.m_TcTasInceptionSpeed, &Button, TCLocalize("Inception Speed"), 1, 1000, &CUi::ms_LinearScrollbarScale, 0, "x");
 	}
+	
+	DoButton_CheckBoxAutoVMarginAndSet(&g_Config.m_TcTasBotAutoKill, TCLocalize("Auto-Kill (3s Stuck)"), &g_Config.m_TcTasBotAutoKill, &Column, LineSize);
 
 	DoButton_CheckBoxAutoVMarginAndSet(&g_Config.m_ClTasHyperTrain, TCLocalize("Hyper-Simulation (Live Speedup)"), &g_Config.m_ClTasHyperTrain, &Column, LineSize);
 

@@ -144,3 +144,9 @@ tags
 /build
 
 !steam_api.dll
+
+# --- PROJECT JARVIS SECURITY ---
+.env
+Global_AI_Toolkit/
+*.env
+API_KEYS_BACKUP.txt
