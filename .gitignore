@@ -145,8 +145,13 @@ tags
 
 !steam_api.dll
 
-# --- PROJECT JARVIS SECURITY ---
+# --- AI SECRETS & API PROTECTION ---
 .env
-Global_AI_Toolkit/
 *.env
 API_KEYS_BACKUP.txt
+Global_AI_Toolkit/
+!Global_AI_Toolkit/diffuser.py
+Global_AI_Toolkit/api_loop.py
+Global_AI_Toolkit/__pycache__/
+*.pem
+*.key
