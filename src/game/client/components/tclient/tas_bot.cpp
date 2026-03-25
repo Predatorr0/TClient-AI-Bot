@@ -1,11 +1,29 @@
 #include <engine/shared/config.h>
 #include <engine/console.h>
 #include <game/client/gameclient.h>
+#include <game/client/components/controls.h>
+#include <game/client/components/tclient/tas_bot.h>
+
+#include <game/client/components/tclient/tas_bot.h>
+
+#include <windows.h>
+#ifdef IMAGE_CURSOR
+#undef IMAGE_CURSOR
+#endif
+// [GHOST_V8_PULSAR_FINAL_VERIFICATION_COMPLETE]
 #include <game/client/components/tclient/tas_bot.h>
 #include <game/client/components/tclient/astar_pathfinder.h>
 #include <game/client/prediction/entities/character.h>
 #include <game/mapitems.h>
+#include <game/client/animstate.h>
+#include <generated/client_data.h>
 #include <algorithm>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <cmath>
+#include <iostream>
+#include "synapse_weights.h"
 
 CTasBot::CTasBot()
 {
@@ -27,6 +45,9 @@ CTasBot::CTasBot()
 	m_PlaybackTick = 0;
 	m_StuckTicks = 0;
 	m_LastStuckPos = vec2(0, 0);
+	m_LastDistToGoal = 1000000.0f;
+	m_LiveLastDist = 0;
+	m_DreamLastDist = 0;
 	// 5 minutes max run: 50 ticks * 60 seconds * 5
 	m_MaxSimulationDepth = 50 * 60 * 5; 
 	m_Attempts = 0;
@@ -39,10 +60,46 @@ CTasBot::CTasBot()
 	m_BannedAction = -1;
 	m_BannedActionTicks = 0;
 	m_ActionHoldElapsed = 0;
-	m_LastDist = 0.0f;
+	m_LiveLastDist = 0.0f;
+	m_DreamLastDist = 0.0f;
 	m_LastUpdatePos = vec2(0,0);
 	m_StuckCounter = 0;
 	for(int i = 0; i < 5; i++) m_PosHistory[i] = vec2(0,0);
+	
+	m_pDiffusionManifold = nullptr;
+	m_LPSDActive = false;
+
+	// Phase 62: Initialize LPSD Shared Memory Bridge (The Oracle Bridge)
+	HANDLE hMapFile = CreateFileMappingA(
+		INVALID_HANDLE_VALUE,
+		NULL,
+		PAGE_READWRITE,
+		0,
+		sizeof(DiffusionBrain),
+		"Global\\TrinityBrain");
+
+	if (hMapFile != NULL)
+	{
+		m_pDiffusionManifold = (DiffusionBrain*)MapViewOfFile(
+			hMapFile,
+			FILE_MAP_ALL_ACCESS,
+			0,
+			0,
+			sizeof(DiffusionBrain));
+		
+		if (m_pDiffusionManifold) {
+			m_LPSDActive = true;
+			dbg_msg("tas_bot", "LPSD SINGULARITY BRIDGE ACTIVE: Global\\TrinityBrain");
+			m_pDiffusionManifold->current_tick_index = 0;
+		}
+	}
+	
+	// Phase 16: Speedrunner Evolution
+	m_BestFinishTicks = 1000000;
+	m_TotalFinishes = 0;
+	m_EpisodeHistory.clear();
+	m_TicksSinceSpawn = 0;
+	m_RecentTiles.clear();
 }
 
 CTasBot::~CTasBot()
@@ -99,10 +156,26 @@ void CTasBot::OnInit()
 
 void CTasBot::OnMapLoad()
 {
-	StopTraining();
+	m_IsTraining = false;
 	m_HasMasterRun = false;
 	m_MasterRun.clear();
-	m_MasterRunPositions.clear();
+	m_StateHistory.clear();
+	m_DeathMemory.clear();
+	m_CurrentEpisodeTicks = 0;
+	m_TicksSinceSpawn = 0;
+	m_RecentTiles.clear();
+	m_AStarPath.clear();
+	m_LastUpdateTick = -1;
+	m_LastAITick = -1;
+	m_LastRecalculateTick = -1;
+	m_InceptionActive = false;
+	
+	m_QTable.clear();
+	LoadMemory();
+
+	// Phase 20: Delayed Init. Don't do heavy work until first active tick.
+	m_MapWidth = 0;
+	m_MapHeight = 0;
 	
 	// Reset world on map change
 	if(m_pTasWorld)
@@ -111,12 +184,300 @@ void CTasBot::OnMapLoad()
 		m_pTasWorld = nullptr;
 	}
 
+	if(m_pPathfinder)
+	{
+		delete m_pPathfinder;
+		m_pPathfinder = nullptr;
+	}
+
+	m_MasterRunPositions.clear();
 	m_CurrentPath.clear();
-	m_StateHistory.clear();
 	
-	// Try to auto-load run for this map (check Map() validity)
 	if(GameClient()->Map())
 		LoadTasRun(GameClient()->Map()->BaseName());
+		
+	// Phase 22: Load Trauma Map from previous sessions
+	LoadTraumaMap();
+}
+
+// Phase 10: Global Flow-Field (Breadth-First Search with Gravity Bias)
+void CTasBot::ComputeDistanceMap()
+{
+	CCollision *pCollision = GameClient()->Collision();
+	if(!pCollision) return;
+
+	m_MapWidth = pCollision->GetWidth();
+	m_MapHeight = pCollision->GetHeight();
+	dbg_msg("tas_bot", "ComputeDistanceMap: Dimensions %dx%d", m_MapWidth, m_MapHeight);
+	m_DistanceMap.assign(m_MapWidth * m_MapHeight, 1000000); // Initialize with "Infinity"
+
+	std::queue<int> Queue;
+
+	// 1. Find all Finish Tiles and set them as sinks (distance 0)
+	for(int y = 0; y < m_MapHeight; y++)
+	{
+		for(int x = 0; x < m_MapWidth; x++)
+		{
+			int Index = y * m_MapWidth + x;
+			int Tile = pCollision->GetTileIndex(Index);
+			int Front = pCollision->GetFrontTileIndex(Index);
+			
+			// Hyper-Aggressive Seeding: Finish, Checkpoints, and Time Checkpoints
+			bool IsGoal = (Tile == TILE_FINISH || Front == TILE_FINISH || 
+			               Tile == TILE_CP || Front == TILE_CP || 
+			               (Tile >= 27 && Tile <= 29) || (Front >= 27 && Front <= 29)); // 27-29 are often CP/Finish in Oldschool
+			
+			if(IsGoal)
+			{
+				m_DistanceMap[Index] = 0;
+				Queue.push(Index);
+			}
+		}
+	}
+
+	if(Queue.empty())
+	{
+		dbg_msg("tas_bot", "WARNING: No Finish/Checkpoints found. Fallback: Seeding bottom-most walkable layer.");
+		for(int x = 0; x < m_MapWidth; x++)
+		{
+			int y = m_MapHeight - 2;
+			int Index = y * m_MapWidth + x;
+			if(!pCollision->IsSolid(x * 32 + 16, y * 32 + 16))
+			{
+				m_DistanceMap[Index] = 0;
+				Queue.push(Index);
+			}
+		}
+	}
+
+	// 2. BFS Flood Fill
+	while(!Queue.empty())
+	{
+		int CurrIdx = Queue.front();
+		Queue.pop();
+
+		int cx = CurrIdx % m_MapWidth;
+		int cy = CurrIdx / m_MapWidth;
+		int CurrDist = m_DistanceMap[CurrIdx];
+
+		// Check 4-Neighbors
+		int dx[] = { 1, -1,  0,  0 };
+		int dy[] = { 0,  0,  1, -1 };
+		int costs[] = { 10, 10, 30, 5 }; // Right/Left: 10, UP: 30 (Hard), DOWN: 5 (Easy)
+
+		for(int i = 0; i < 4; i++)
+		{
+			int nx = cx + dx[i];
+			int ny = cy + dy[i];
+
+			if(nx < 0 || nx >= m_MapWidth || ny < 0 || ny >= m_MapHeight) continue;
+
+			int NextIdx = ny * m_MapWidth + nx;
+			
+			// Collision Check (Skip solids)
+			if(pCollision->IsSolid(nx * 32 + 16, ny * 32 + 16)) continue;
+
+			// Phase 10: Freeze Penalty
+			int Penalty = 0;
+			int Tile = pCollision->GetTileIndex(NextIdx);
+			int Front = pCollision->GetFrontTileIndex(NextIdx);
+			if(Tile == TILE_FREEZE || Front == TILE_FREEZE) Penalty += 500;
+			
+			// Phase 22: Inject Trauma Penalty (Dynamic Death Avoidance)
+			if (m_TraumaMap.count(NextIdx))
+				Penalty += m_TraumaMap[NextIdx] * 100;
+
+			int NewDist = CurrDist + costs[i] + Penalty;
+			if(NewDist < m_DistanceMap[NextIdx])
+			{
+				m_DistanceMap[NextIdx] = NewDist;
+				Queue.push(NextIdx);
+			}
+		}
+	}
+
+	// 3. Phase 17: Golden Thread (Wall Repulsion Pass)
+	// Artificially increase cost of tiles near walls to force the path to the center.
+	for(int y = 1; y < m_MapHeight - 1; y++)
+	{
+		for(int x = 1; x < m_MapWidth - 1; x++)
+		{
+			int Index = y * m_MapWidth + x;
+			if(m_DistanceMap[Index] >= 1000000) continue;
+
+			bool NearWall = false;
+			for(int oy = -1; oy <= 1; oy++)
+			{
+				for(int ox = -1; ox <= 1; ox++)
+				{
+					if(pCollision->IsSolid((x + ox) * 32 + 16, (y + oy) * 32 + 16))
+					{
+						NearWall = true;
+						break;
+					}
+				}
+				if(NearWall) break;
+			}
+			if(NearWall) m_DistanceMap[Index] += 15; // Phase 17: Golden Thread cost
+		}
+	}
+
+	dbg_msg("tas_bot", "Global Flow-Field (Golden Thread) computed for %dx%d map.", m_MapWidth, m_MapHeight);
+}
+
+int CTasBot::GetDistanceMapValue(vec2 Pos)
+{
+	if(m_DistanceMap.empty()) return 1000000;
+	int tx = std::clamp((int)(Pos.x / 32.0f), 0, m_MapWidth - 1);
+	int ty = std::clamp((int)(Pos.y / 32.0f), 0, m_MapHeight - 1);
+	return m_DistanceMap[ty * m_MapWidth + tx];
+}
+
+vec2 CTasBot::GetFlowGradient(vec2 Pos)
+{
+	if(m_DistanceMap.empty()) return vec2(0, 0);
+	int tx = std::clamp((int)(Pos.x / 32.0f), 1, m_MapWidth - 2);
+	int ty = std::clamp((int)(Pos.y / 32.0f), 1, m_MapHeight - 2);
+
+	// Find the adjacent tile with the lowest distance
+	int MinDist = m_DistanceMap[ty * m_MapWidth + tx];
+	vec2 BestDir = vec2(0, 0);
+
+	int dx[] = { 1, -1, 0, 0, 1, 1, -1, -1 };
+	int dy[] = { 0, 0, 1, -1, 1, -1, 1, -1 };
+
+	for(int i = 0; i < 8; i++)
+	{
+		int d = m_DistanceMap[(ty + dy[i]) * m_MapWidth + (tx + dx[i])];
+		if(d < MinDist)
+		{
+			MinDist = d;
+			BestDir = vec2((float)dx[i], (float)dy[i]);
+		}
+	}
+
+	if(length(BestDir) > 0.001f) return normalize(BestDir);
+	return vec2(0, 0);
+}
+
+uint64_t CTasBot::GetStateHash(const CCharacterCore& Core)
+{
+	// 1. Map Position (Tile-based 32px resolution)
+	int PosX = (int)(Core.m_Pos.x / 32.0f);
+	int PosY = (int)(Core.m_Pos.y / 32.0f);
+	
+	// Phase 17: Robust Velocity Hashing (5 Broad States)
+	// Reduced sensitivity to 1-pixel drifts and ping jitters.
+	int VelX = (abs(Core.m_Vel.x) < 5.0f) ? 0 : (Core.m_Vel.x > 0 ? 1 : 2);
+	int VelY = (abs(Core.m_Vel.y) < 5.0f) ? 0 : (Core.m_Vel.y > 0 ? 3 : 4);
+	
+	// Phase 10: BFS Distance Map Gradient (Smoothed direction)
+	vec2 Grad = GetFlowGradient(Core.m_Pos);
+	int gx = (Grad.x > 0.1f) ? 1 : (Grad.x < -0.1f ? 2 : 0);
+	int gy = (Grad.y > 0.1f) ? 3 : (Grad.y < -0.1f ? 4 : 0);
+	
+	int Hook = (Core.m_HookState != 0);
+	int Jump = (Core.m_Jumped & 1);
+	
+	// Phase 14: Future Trajectory Projection (Hazard Awareness)
+	vec2 FuturePos = Core.m_Pos + (Core.m_Vel * 15.0f * 0.3f);
+	int TileIdx = GameClient()->Collision()->GetPureMapIndex(FuturePos);
+	bool Dangerous = GameClient()->Collision()->GetTileIndex(TileIdx) == TILE_FREEZE;
+	int Hazard = Dangerous ? 1 : 0;
+	
+	uint64_t Hash = (uint64_t)(PosX & 0x7FFF); 
+	Hash |= ((uint64_t)(PosY & 0x3FFF) << 15);
+	Hash |= ((uint64_t)VelX << 29);
+	Hash |= ((uint64_t)VelY << 34);
+	Hash |= ((uint64_t)gx << 39);
+	Hash |= ((uint64_t)gy << 44);
+	Hash |= ((uint64_t)Hook << 49);
+	Hash |= ((uint64_t)Jump << 50);
+	Hash |= ((uint64_t)Hazard << 51);
+	
+	return Hash;
+}
+
+CNetObj_PlayerInput CTasBot::MapActionToInput(int Action, const CCharacterCore& Core, vec2 TargetPos)
+{
+	CNetObj_PlayerInput Input = {0};
+	// Multi-Discrete Action Space (60 combinations)
+	// Move: 0=None, 1=Left, 2=Right
+	// Jump: 0=Off, 1=On
+	// Hook Style: 0=None, 1=Flow-Field, 2-9=8 Directional Aiming
+	
+	int Move = Action % 3;
+	int Jump = (Action / 3) % 2;
+	int HookStyle = (Action / 6) % 10;
+	
+	if (Move == 1) Input.m_Direction = -1;
+	else if (Move == 2) Input.m_Direction = 1;
+	
+	Input.m_Jump = Jump;
+	
+	if (HookStyle > 0)
+	{
+		Input.m_Hook = 1;
+		vec2 IdealDir;
+		if (HookStyle == 1) // Flow-Field Waypoint
+			IdealDir = TargetPos - Core.m_Pos;
+		else // 8-Way Aiming
+		{
+			float Angle = (HookStyle - 2) * 45.0f * (3.14159f / 180.0f);
+			IdealDir = vec2(sin(Angle), -cos(Angle));
+		}
+		
+		// Phase 14: Smart Aim Assist (Raycast Targeter)
+		vec2 BestWall = FindBestHookTarget(Core.m_Pos, IdealDir, 380.0f);
+		vec2 AimDir = (BestWall.x != 0 || BestWall.y != 0) ? (BestWall - Core.m_Pos) : IdealDir * 300.0f;
+		
+		Input.m_TargetX = (int)AimDir.x;
+		Input.m_TargetY = (int)AimDir.y;
+		
+		// Phase 14: Hook Persistence (Muscle Fix)
+		// m_Hook = 1 is already set, and we ensure it stays 1 for the duration of hold
+	}
+	
+	return Input;
+}
+
+// Phase 64: The Sovereign Centaur (Native Forward-Simulator)
+CTasBot::SOracleTrajectory CTasBot::VerifyTrajectoryPrior(const STasActionSequence& PriorSequence)
+{
+	SOracleTrajectory Result;
+	Result.m_IsPhysicallyValid = true;
+	Result.m_SurvivalTicks = 0;
+
+	// 1. THE SINGULARITY CLONE
+	CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
+	if (!pLocalChar) return Result;
+	CCharacterCore SimCore = pLocalChar->GetCore();
+	CCollision *pCollision = GameClient()->Collision();
+	
+	// 2. THE DETERMINISTIC INNER LOOP
+	for(int tick = 0; tick < PriorSequence.m_NumTicks && tick < 100; ++tick)
+	{
+		// Inject hallucinated input
+		SimCore.m_Input = PriorSequence.m_Inputs[tick];
+
+		// Execute DDNet Physics (Cloned)
+		SimCore.Tick(true); 
+		SimCore.Move();
+
+		// 3. GEOMETRY VERIFICATION
+		int TileIndex = pCollision->GetTile(round_to_int(SimCore.m_Pos.x) / 32, round_to_int(SimCore.m_Pos.y) / 32);
+
+		if(TileIndex == TILE_DEATH || TileIndex == TILE_FREEZE) 
+		{
+			Result.m_IsPhysicallyValid = false;
+			break; 
+		}
+		Result.m_SurvivalTicks++;
+	}
+
+	Result.m_EndPos = SimCore.m_Pos;
+	Result.m_EndVel = SimCore.m_Vel;
+	return Result;
 }
 
 void CTasBot::OnStateChange(int NewState, int OldState)
@@ -288,7 +649,7 @@ CNetObj_PlayerInput CTasBot::GetNextExplorationInput(bool ForceJump, vec2 Curren
 			if(m_StuckTicks > 180) // Stuck for 3 seconds -> KILL
 			{
 				if (g_Config.m_TcBotLogging)
-					dbg_msg("tas_bot", "AI is STUCK. Implementing SUICIDE (kill) to restart training.");
+					dbg_msg("tas_bot", "AI is STUCK. Implementing SUICIDE (say /kill) to restart training.");
 				m_CurrentPath.clear();
 				m_StateHistory.clear();
 				m_pTasWorld->LoadFromCurrentCore(m_StartCore);
@@ -342,107 +703,6 @@ vec2 CTasBot::GetDynamicWaypoint(vec2 BotPos)
 	return m_AStarPath.back();
 }
 
-uint64_t CTasBot::GetStateHash(const CCharacterCore& Core, vec2 DynamicWaypoint)
-{
-	// 1. Target Angle (3 bits / 8 octants)
-	vec2 TargetDir = DynamicWaypoint - Core.m_Pos;
-	float Angle = atan2(TargetDir.y, TargetDir.x);
-	if(Angle < 0) Angle += 2.0f * pi;
-	uint64_t TargetOctant = (uint64_t)(floor((Angle + pi/8.0f) / (pi/4.0f))) % 8;
-
-	// 2. Velocity Vector (4 bits / 9 states)
-	uint64_t VelState = 0;
-	float VelLen = length(Core.m_Vel);
-	if(VelLen > 1.0f)
-	{
-		float VelAngle = atan2(Core.m_Vel.y, Core.m_Vel.x);
-		if(VelAngle < 0) VelAngle += 2.0f * pi;
-		VelState = 1 + ((uint64_t)(floor((VelAngle + pi/8.0f) / (pi/4.0f))) % 8);
-	}
-
-	// 3. Raycast Sensors (Whiskers) (8 bits / 4 directions)
-	uint64_t WhiskerMask = 0;
-	vec2 Dirs[] = { vec2(0,-1), vec2(0,1), vec2(-1,0), vec2(1,0) }; // UP, DOWN, LEFT, RIGHT
-	for(int i = 0; i < 4; i++)
-	{
-		uint64_t Type = 0; // Empty
-		for(int d = 1; d <= 4; d++)
-		{
-			vec2 CheckPos = Core.m_Pos + Dirs[i] * (float)(d * 32);
-			int Index = GameClient()->Collision()->GetPureMapIndex(CheckPos);
-			int Tile = GameClient()->Collision()->GetTileIndex(Index);
-			int Front = GameClient()->Collision()->GetFrontTileIndex(Index);
-			
-			bool Danger = (Tile == TILE_DEATH || Front == TILE_DEATH || Tile == TILE_FREEZE || Front == TILE_FREEZE);
-			bool Solid = GameClient()->Collision()->CheckPoint(CheckPos);
-			bool Hookable = (Tile == TILE_NOHOOK || Front == TILE_NOHOOK) ? false : Solid;
-
-			if(Danger) { Type = 3; break; }
-			if(Solid) { Type = Hookable ? 1 : 2; break; }
-		}
-		WhiskerMask |= (Type << (i * 2));
-	}
-
-	// 4. Hook Status (1 bit)
-	uint64_t HookBit = (Core.m_HookState == 5) ? 1 : 0; // 5 is HOOK_GRABBED in many DDNet versions
-
-	return (TargetOctant) | (VelState << 3) | (WhiskerMask << 7) | (HookBit << 15);
-}
-
-CNetObj_PlayerInput CTasBot::MapActionToInput(int Action, const CCharacterCore& Core, vec2 DynamicWaypoint)
-{
-	CNetObj_PlayerInput Inp = {0};
-	
-	// Default target: Waypoint
-	vec2 TargetDir = DynamicWaypoint - Core.m_Pos;
-	Inp.m_TargetX = (int)TargetDir.x;
-	Inp.m_TargetY = (int)TargetDir.y;
-
-	switch(Action)
-	{
-		case 0: Inp.m_Direction = -1; break; // Move Left
-		case 1: Inp.m_Direction = 1; break;  // Move Right
-		case 2: Inp.m_Jump = 1; break;       // Jump
-		case 3: // Direct Hook (Waypoint)
-		{
-			Inp.m_Hook = 1;
-			if(Inp.m_TargetX == 0 && Inp.m_TargetY == 0)
-				Inp.m_TargetY = -1; // Force non-zero
-			break;
-		}
-		case 4: // Action 4: Ceiling/Swing Hook
-		{
-			// Scan for nearest solid tile above or upper-diagonal
-			vec2 BestCeiling(0, -96);
-			bool Found = false;
-			for(int ay = -1; ay >= -5; ay--) // Scan UP
-			{
-				for(int ax = -2; ax <= 2; ax++) // Lateral spread
-				{
-					vec2 CheckPos = Core.m_Pos + vec2(ax * 32.0f, ay * 32.0f);
-					if(GameClient()->Collision()->CheckPoint(CheckPos))
-					{
-						BestCeiling = vec2(ax * 32.0f, ay * 32.0f);
-						Found = true;
-						goto found_ceiling;
-					}
-				}
-			}
-			found_ceiling:
-			Inp.m_TargetX = (int)BestCeiling.x;
-			Inp.m_TargetY = (int)BestCeiling.y;
-			if(Inp.m_TargetX == 0 && Inp.m_TargetY == 0)
-				Inp.m_TargetY = -1; // Safety
-			Inp.m_Hook = 1;
-			break;
-		}
-		case 5: Inp.m_Hook = 0; break; // Release Hook
-		case 6: Inp.m_Direction = 1; Inp.m_Jump = 1; break; // Right + Jump
-		case 7: Inp.m_Direction = -1; Inp.m_Jump = 1; break; // Left + Jump
-	}
-	return Inp;
-}
-
 void CTasBot::SaveMemory()
 {
 	IOHANDLE File = io_open("tas_bot_brain.dat", IOFLAG_WRITE);
@@ -455,12 +715,12 @@ void CTasBot::SaveMemory()
 	for(auto const& [Hash, Values] : m_QTable)
 	{
 		io_write(File, &Hash, sizeof(Hash));
-		uint32_t VecSize = 8; // Fixed size for std::array<float, 8>
+		uint32_t VecSize = 60; // Fixed size for std::array<float, 60>
 		io_write(File, &VecSize, sizeof(VecSize));
 		io_write(File, Values.data(), VecSize * sizeof(float));
 	}
 	io_close(File);
-	dbg_msg("tas_bot", "Memory saved: %u states.", Size);
+	dbg_msg("tas_bot", "Memory saved: %u states (Phase 11).", Size);
 }
 
 void CTasBot::LoadMemory()
@@ -478,39 +738,37 @@ void CTasBot::LoadMemory()
 		uint32_t VecSize = 0;
 		io_read(File, &VecSize, sizeof(VecSize));
 		
-		std::array<float, 8> Values;
+		std::array<float, 60> Values;
 		Values.fill(0.0f);
 		
-		if(VecSize == 8)
+		if(VecSize == 60)
 		{
-			io_read(File, Values.data(), 8 * sizeof(float));
+			io_read(File, Values.data(), 60 * sizeof(float));
 		}
 		else
 		{
-			// Handle legacy data or mixed sizes if necessary
+			// Handle legacy data or mixed sizes
 			std::vector<float> Legacy(VecSize);
 			io_read(File, Legacy.data(), VecSize * sizeof(float));
-			for(uint32_t j = 0; j < std::min(VecSize, 8u); j++)
+			for(uint32_t j = 0; j < std::min(VecSize, 60u); j++)
 				Values[j] = Legacy[j];
 		}
 		m_QTable[Hash] = Values;
 	}
 	io_close(File);
-	dbg_msg("tas_bot", "Memory loaded: %u states.", Size);
+	dbg_msg("tas_bot", "Memory loaded: %u states (Phase 11).", Size);
 }
 
 void CTasBot::UpdateQValue(uint64_t State, int Action, float Reward, uint64_t NextState)
 {
-	if(Action < 0 || Action >= 8) return;
+	if(Action < 0 || Action >= 60) return;
 	
-	// std::array is fixed size, no resize needed. operator[] value-initializes the array (zeros it).
-
 	float MaxNextQ = -1e18f;
-	for(int i = 0; i < 8; ++i) if(m_QTable[NextState][i] > MaxNextQ) MaxNextQ = m_QTable[NextState][i];
+	for(int i = 0; i < 60; ++i) if(m_QTable[NextState][i] > MaxNextQ) MaxNextQ = m_QTable[NextState][i];
 
-	// Q-Learning Bellman Equation
-	float Alpha = 0.1f;
-	float Gamma = 0.9f;
+	// Phase 18: Optimized Hyperparameters for long-horizon platforming
+	float Alpha = 0.2f; 
+	float Gamma = 0.99f; 
 	m_QTable[State][Action] += Alpha * (Reward + Gamma * MaxNextQ - m_QTable[State][Action]);
 }
 
@@ -635,7 +893,8 @@ float CTasBot::EvaluateState(const CCandidatePath& Cand, const CCharacterCore& S
 
 CNetObj_PlayerInput CTasBot::GetBestLiveInput(const CCharacterCore& CurrentCore)
 {
-	if(!m_IsTraining) return {0};
+	// Phase 19: Allow execution during Playback mode
+	if(!m_IsTraining && !g_Config.m_TcTasBotPlayback) return {0};
 
 	// 1. Gemini Pro 50Hz Master Tick-Lock
 	int CurrentTick = GameClient()->Client()->GameTick(0);
@@ -660,7 +919,6 @@ CNetObj_PlayerInput CTasBot::GetBestLiveInput(const CCharacterCore& CurrentCore)
 	m_PosHistory[m_PosHistoryIdx] = CurrentCore.m_Pos;
 	m_PosHistoryIdx = (m_PosHistoryIdx + 1) % 5;
 
-	vec2 DynamicWaypoint = GetDynamicWaypoint(CurrentCore.m_Pos);
 
 	// 3. FRAME-HOLD: Persistence & Interrupt
 	if(m_ActionHoldFrames > 0)
@@ -677,16 +935,21 @@ CNetObj_PlayerInput CTasBot::GetBestLiveInput(const CCharacterCore& CurrentCore)
 			if(HorizontalStuck || IsBlocked)
 			{
 				dbg_msg("tas_bot", "INTERRUPT: Wall detected at 50Hz (dx:%.2f, Act:%d).", dx, m_CurrentAction);
-				UpdateQValue(m_LastStateHash, m_CurrentAction, -2000.0f, GetStateHash(CurrentCore, DynamicWaypoint));
+				
+				// Phase 19: No learning during Playback
+				if (!g_Config.m_TcTasBotPlayback)
+					UpdateQValue(m_LastStateHash, m_CurrentAction, -2000.0f, GetStateHash(CurrentCore));
+
 				m_BannedAction = m_CurrentAction;
 				m_BannedActionTicks = 25; 
-				m_ActionHoldFrames = 0;
+				m_ActionHoldFrames = 3; // Phase 12: Enforce 3-frame hold to reduce jitter
+				m_ActionHoldElapsed = 0;
 			}
 		}
 
 		if(m_ActionHoldFrames > 0)
 		{
-			m_LastInput = MapActionToInput(m_CurrentAction, CurrentCore, DynamicWaypoint);
+			m_LastInput = MapActionToInput(m_CurrentAction, CurrentCore, CurrentCore.m_Pos + GetFlowGradient(CurrentCore.m_Pos) * 100.0f);
 			if(m_CurrentAction == 2 && m_ActionHoldElapsed > 1) m_LastInput.m_Jump = 0;
 			return m_LastInput;
 		}
@@ -694,36 +957,45 @@ CNetObj_PlayerInput CTasBot::GetBestLiveInput(const CCharacterCore& CurrentCore)
 
 	// 4. NEW DECISION ENGINE (50Hz)
 	m_ActionHoldElapsed = 0;
-	uint64_t State = GetStateHash(CurrentCore, DynamicWaypoint);
+	uint64_t State = GetStateHash(CurrentCore);
+
+	// Phase 19: Zero-Epsilon Reality Lock
+	// In the real world / Playback mode, we NEVER explore. Strict exploitation only.
+	float SampleEpsilon = m_Epsilon;
+	if(!m_InceptionActive || g_Config.m_TcTasBotPlayback) SampleEpsilon = 0.0f;
 
 	int Action = -1;
 	bool IsRandom = false;
-	if((float)(rand() % 1000) / 1000.0f < m_Epsilon)
+	if((float)(rand() % 1000) / 1000.0f < SampleEpsilon)
 	{
 		IsRandom = true;
 		do {
-			Action = rand() % 8;
+			Action = rand() % 60;
 		} while(Action == m_BannedAction && m_BannedActionTicks > 0 && (rand() % 10) < 9); 
 	}
 	else
 	{
 		float MaxQ = -1e18f;
-		for(int i = 0; i < 8; i++)
+		bool HasKnowledge = false;
+		for(int i = 0; i < 60; i++)
 		{
 			if(i == m_BannedAction && m_BannedActionTicks > 0) continue;
+			if(m_QTable[State][i] != 0.0f) HasKnowledge = true;
 			if(m_QTable[State][i] > MaxQ)
 			{
 				MaxQ = m_QTable[State][i];
 				Action = i;
 			}
 		}
-		if(Action == -1) Action = rand() % 8;
+		
+		// Phase 19 Fallback: If state is unknown and playing in reality or playback, stay neutral.
+		if(!HasKnowledge && (!m_InceptionActive || g_Config.m_TcTasBotPlayback)) Action = 0;
+		if(Action == -1) Action = 0;
 	}
 
 	m_CurrentAction = Action;
 	
 	// Forensic Trace
-	int Restrictions = GameClient()->Collision()->GetMoveRestrictions(CurrentCore.m_Pos);
 	dbg_msg("tas_bot", "RECAP 50Hz: State:%llu Act:%d (Rand:%d) Eps:%.3f PosX:%.1f", 
 		State, Action, IsRandom, (float)m_Epsilon, CurrentCore.m_Pos.x);
 	
@@ -732,7 +1004,7 @@ CNetObj_PlayerInput CTasBot::GetBestLiveInput(const CCharacterCore& CurrentCore)
 	m_ActionHoldElapsed = 0;
 	m_LastStateHash = State;
 	
-	m_LastInput = MapActionToInput(m_CurrentAction, CurrentCore, DynamicWaypoint);
+	m_LastInput = MapActionToInput(m_CurrentAction, CurrentCore, CurrentCore.m_Pos + GetFlowGradient(CurrentCore.m_Pos) * 100.0f);
 	return m_LastInput;
 }
 
@@ -831,20 +1103,14 @@ void CTasBot::StepTrainingBatch()
 				m_pTasWorld->LoadFromCurrentCore(StartBatchCore);
 				Cand.m_IsDead = false;
 				
-				// Generate a specialized strategy for this candidate
-				int Strategy = c % 8; 
+				// Generate a specialized strategy for this candidate (Upgraded to 18 states)
+				int Strategy = c % 18; 
 				for(int t = 0; t < m_CandidateTicks; t++)
 				{
-					CNetObj_PlayerInput CandInput = {0};
-					// 0: Right, 1: Left, 2: Right+Hook, 3: Left+Hook, 4: Right+Jump, 5: Left+Jump, 6: Hook-Only, 7: Random
-					if(Strategy == 0) CandInput.m_Direction = 1;
-					else if(Strategy == 1) CandInput.m_Direction = -1;
-					else if(Strategy == 2) { CandInput.m_Direction = 1; CandInput.m_Hook = 1; CandInput.m_TargetY = -100; }
-					else if(Strategy == 3) { CandInput.m_Direction = -1; CandInput.m_Hook = 1; CandInput.m_TargetY = -100; }
-					else if(Strategy == 4) { CandInput.m_Direction = 1; CandInput.m_Jump = 1; }
-					else if(Strategy == 5) { CandInput.m_Direction = -1; CandInput.m_Jump = 1; }
-					else if(Strategy == 6) { CandInput.m_Hook = 1; CandInput.m_TargetY = -100; }
-					else { CandInput.m_Direction = (rand()%3)-1; CandInput.m_Jump = rand()%2; CandInput.m_Hook = rand()%2; }
+				// 3. Map Action to Input
+				CNetObj_PlayerInput CandInput;
+				CandInput = MapActionToInput(Strategy, StartBatchCore, StartBatchCore.m_Pos + GetFlowGradient(StartBatchCore.m_Pos) * 100.0f);
+					if(Strategy == 17) { CandInput.m_Direction = (rand()%3)-1; CandInput.m_Jump = rand()%2; CandInput.m_Hook = rand()%2; }
 					
 					m_pTasWorld->SimulateTick(CandInput);
 					Cand.m_Inputs.push_back(CandInput);
@@ -916,24 +1182,58 @@ void CTasBot::StartPlayback()
 }
 void CTasBot::OnUpdate()
 {
-	// === SAFETY GATE ===
-	if(!GameClient()->Collision() || GameClient()->m_Snap.m_LocalClientId < 0)
-		return;
+	static int s_TraceCounter = 0;
+	if (s_TraceCounter++ % 100 == 0) dbg_msg("tas_bot_trace", "OnUpdate Entry (Tick %d)", GameClient()->Client()->GameTick(0));
 
-	// === MUTUAL EXCLUSION ===
-	if(g_Config.m_ClTasTraining && g_Config.m_ClTasPlayback)
-	{
-		g_Config.m_ClTasPlayback = 0; 
-		dbg_msg("tas_bot", "CONFLICT: Disabling Playback Mode because Training Mode is active.");
+	// === SAFETY GATE ===
+	CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
+	if (!pLocalChar) return;
+	CCharacterCore CurrentCore = pLocalChar->GetCore();
+
+	// Phase 62: LPSD (Latent Phase-Space Diffusion) State Sync
+	if (m_LPSDActive && m_pDiffusionManifold) {
+		m_pDiffusionManifold->current_pos_x = CurrentCore.m_Pos.x;
+		m_pDiffusionManifold->current_pos_y = CurrentCore.m_Pos.y;
+		m_pDiffusionManifold->current_vel_x = CurrentCore.m_Vel.x;
+		m_pDiffusionManifold->current_vel_y = CurrentCore.m_Vel.y;
+		m_pDiffusionManifold->current_tick_index++; // Heatbeat for Python Denoising
+
+		// If LPSD playback is active, intercept control
+		if (g_Config.m_ClTasPlayback == 2) { // Mode 2 = LPSD Direct Manifold
+			int local_idx = (m_pDiffusionManifold->current_tick_index % 100);
+			int action = m_pDiffusionManifold->predicted_actions[local_idx];
+			
+			// Inject action directly into the engine
+			CNetObj_PlayerInput Inp = {0};
+			Inp.m_Direction = (action == 1) ? -1 : (action == 2 ? 1 : 0);
+			Inp.m_Jump = (action == 3) ? 1 : 0;
+			Inp.m_Hook = (action == 4) ? 1 : 0;
+			
+			// Force apply (Oracle Override)
+			GameClient()->m_Controls.m_aInputData[GameClient()->m_Snap.m_LocalClientId] = Inp;
+			return; // Bypass traditional decision logic
+		}
 	}
 
-	if(!g_Config.m_ClTasTraining)
+	// Phase 57: Protocol Injector - Aggressive Initialization
+	if (m_MapWidth <= 0 || m_DistanceMap.empty() || m_DistanceMap[0] == 1000000) {
+		CCollision *pColl = GameClient()->Collision();
+		if(pColl && pColl->GetWidth() > 0)
+		{
+			dbg_msg("tas_bot", "Map Content Detected (%dx%d): Building Navigation Engine...", pColl->GetWidth(), pColl->GetHeight());
+			ComputeDistanceMap();
+			if (!m_pPathfinder) m_pPathfinder = new CAStarPathfinder(pColl);
+			dbg_msg("tas_bot", "Navigation Ready.");
+		}
+	}
+
+	if(!g_Config.m_ClTasTraining && !g_Config.m_TcTasBotPlayback)
 	{
 		StopTraining();
 		return;
 	}
 
-	if(!m_IsTraining) StartTraining();
+	if(!m_IsTraining && g_Config.m_ClTasTraining) StartTraining();
 
 	int CurrentTick = GameClient()->Client()->GameTick(0);
 	if(CurrentTick <= m_LastUpdateTick) return;
@@ -949,15 +1249,12 @@ void CTasBot::OnUpdate()
 			dbg_msg("tas_bot", "INCEPTION MODE ENABLED: Dreaming at light speed...");
 		}
 
-		// Run multiple simulation ticks per render frame with a 2ms budget
-		int64_t StartTime = time_get();
-		int64_t Budget = time_freq() / 500; // 2ms budget
-		for (int i = 0; i < g_Config.m_ClTasBotInceptionSpeed; ++i)
-		{
-			if(i % 5 == 0 && (time_get() - StartTime) > Budget)
-				break;
+		// Phase 16: Decoupled Simulation Speed (Unflickered UI)
+		int SimTicks = g_Config.m_TcTasInceptionSpeed / 50;
+		if(SimTicks < 1) SimTicks = 1;
+
+		for(int i = 0; i < SimTicks; i++)
 			RunInceptionTick();
-		}
 	}
 	else if (m_InceptionActive)
 	{
@@ -965,7 +1262,7 @@ void CTasBot::OnUpdate()
 		dbg_msg("tas_bot", "INCEPTION MODE DISABLED: Waking up.");
 	}
 
-	// Phase 7: GPS FIX - Continuous Dynamic Recalculation
+	// Phase 19: GPS FIX - Continuous Dynamic Recalculation (Shared by Training & Playback)
 	if(m_LastRecalculateTick == -1 || CurrentTick > m_LastRecalculateTick + 25)
 	{
 		m_LastRecalculateTick = CurrentTick;
@@ -997,59 +1294,95 @@ void CTasBot::OnUpdate()
 	}
 
 	// === Q-LEARNING UPDATE ===
-	CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
+	pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
 	if(pLocalChar)
 	{
-		vec2 DynamicWaypoint = GetDynamicWaypoint(pLocalChar->GetCore().m_Pos);
-		uint64_t CurrentState = GetStateHash(pLocalChar->GetCore(), DynamicWaypoint);
+		CurrentCore = pLocalChar->GetCore();
+		uint64_t CurrentState = GetStateHash(CurrentCore);
 		
-		// Compute Reward for the frame
-		float Reward = 0.0f;
+		// Phase 10: Dynamic Reward Evaluation (Real-time)
+		CCollision *pCollision = GameClient()->Collision();
+		// Phase 62: Hierarchical Objective Fusion (H-OF)
+		float CurrentPotential = (float)GetDistanceMapValue(CurrentCore.m_Pos);
+		m_LastDistToGoal = CurrentPotential;
 		
-		// 1. Progress Reward
-		if(!m_AStarPath.empty())
+		// 1. Macro: Path Progress (A* Flow-Field)
+		m_CurrentReward.macro_path_progress = (float)m_LiveLastDist - CurrentPotential;
+		m_LiveLastDist = (int)CurrentPotential;
+
+		// 2. Meso: Trauma Avoidance (Phase-Space Density)
+		float trauma_level = GetPhaseSpaceTrauma(CurrentCore.m_Pos, CurrentCore.m_Vel);
+		m_CurrentReward.meso_trauma_avoidance = 1.0f - trauma_level;
+
+		// 3. Micro: Kinetic Energy (KOG Momentum Preservation)
+		float current_speed_sq = (CurrentCore.m_Vel.x * CurrentCore.m_Vel.x) + (CurrentCore.m_Vel.y * CurrentCore.m_Vel.y);
+		m_CurrentReward.micro_kinetic_energy = 0.5f * current_speed_sq;
+
+		// Total Unified Reward for Neural Swarm (Backward Compatibility)
+		float total_reward = (m_CurrentReward.macro_path_progress * 100.0f) + 
+		                    (m_CurrentReward.meso_trauma_avoidance * 50.0f) + 
+		                    (m_CurrentReward.micro_kinetic_energy * 5.0f);
+
+		// Telemetry Heartbeat Update
+		char aBuf[256];
+		str_format(aBuf, sizeof(aBuf), "[HEARTBEAT] Dist: %.2f M:%.2f m:%.2f K:%.2f", 
+			CurrentPotential, m_CurrentReward.macro_path_progress, 
+			m_CurrentReward.meso_trauma_avoidance, m_CurrentReward.micro_kinetic_energy);
+		
+		DumpTelemetry("HEARTBEAT", CurrentCore.m_Pos);
+		if (g_Config.m_TcBotLogging) dbg_msg("tas_bot", "%s", aBuf);
+
+		// 3. Static Stalling Check
+		float current_speed = sqrt(current_speed_sq);
+		bool on_ice = pCollision->GetTile(round_to_int(CurrentCore.m_Pos.x) / 32, round_to_int(CurrentCore.m_Pos.y) / 32) == TILE_FREEZE;
+		if (current_speed < 1.0f && !on_ice) total_reward -= (200.0f * m_ExplorationBoost);
+
+		// 4. Goal Proximity Multiplier
+		float finish_multiplier = 1.0f + (8000.0f / (CurrentPotential + 1.0f));
+		total_reward *= finish_multiplier;
+
+		float Reward = total_reward;
+		// [END_REWARD]
+		ExportNeuralState(Reward);
+
+		// 1. Update REAL knowledge
+		// Phase 19: Disable learning during Playback
+		if (!g_Config.m_TcTasBotPlayback)
+			UpdateQValue(m_LastStateHash, m_CurrentAction, Reward, CurrentState);
+
+		// 2. Dyna-Q: Store Experience
+		CTransition Trans = { m_LastStateHash, m_CurrentAction, Reward, CurrentState };
+		m_ExperienceBuffer.push_back(Trans);
+		if((int)m_ExperienceBuffer.size() > MAX_EXPERIENCE) m_ExperienceBuffer.erase(m_ExperienceBuffer.begin());
+
+		// 3. Dyna-Q: Background Replay (10x faster learning)
+		if(!m_ExperienceBuffer.empty())
 		{
-			float DistToGoal = distance(pLocalChar->GetCore().m_Pos, m_AStarPath.back());
-			if(m_LastDist == 0.0f) m_LastDist = DistToGoal;
-			Reward += (m_LastDist - DistToGoal) * 1.0f; // Weight increased
-			m_LastDist = DistToGoal;
-			
-			if(distance(pLocalChar->GetCore().m_Pos, DynamicWaypoint) < 96.0f)
-				Reward += 5.0f; // Milestone bonus
-		}
-		
-		Reward += length(pLocalChar->GetCore().m_Vel) * 0.05f;
-		
-		// 3. Tarzan Reward (Momentum Shaping)
-		float CurrentHVel = abs(pLocalChar->GetCore().m_Vel.x);
-		if(m_CurrentAction == 4 || m_CurrentAction == 5)
-		{
-			// If we are swinging or releasing, reward building horizontal momentum towards waypoint side
-			vec2 ToWaypoint = DynamicWaypoint - pLocalChar->GetCore().m_Pos;
-			bool CorrectDir = (ToWaypoint.x > 0 && pLocalChar->GetCore().m_Vel.x > 5.0f) || 
-			                  (ToWaypoint.x < 0 && pLocalChar->GetCore().m_Vel.x < -5.0f);
-			
-			if(CorrectDir && CurrentHVel > m_PreviousHorizontalVel + 1.0f)
+			for(int r = 0; r < 10; r++)
 			{
-				Reward += 50.0f; // MASSIVE TARZAN BONUS
-				dbg_msg("tas_bot", "TARZAN! Momentum gain: %.2f -> %.2f", m_PreviousHorizontalVel, CurrentHVel);
+				int idx = rand() % m_ExperienceBuffer.size();
+				const auto& t = m_ExperienceBuffer[idx];
+				UpdateQValue(t.m_State, t.m_Action, t.m_Reward, t.m_NextState);
 			}
 		}
-		m_PreviousHorizontalVel = CurrentHVel;
 
-		// 4. Floor Penalty
-		if(GameClient()->Collision()->CheckPoint(pLocalChar->GetCore().m_Pos + vec2(0, 16)))
-		{
-			Reward -= 1.0f;
-		}
-
-		// 5. Perform the actual Q-Learning update
-		UpdateQValue(m_LastStateHash, m_CurrentAction, Reward, CurrentState);
 		m_LastStateHash = CurrentState;
 		
-		// 3. Auto-Kill / Stuck Detection
-		bool ForceReset = false;
-		if(distance(pLocalChar->GetCore().m_Pos, m_LastUpdatePos) < 5.0f)
+		// 3. Auto-Kill / Stuck Detection (Consolidated V2)
+		bool IsFrozenLive = false;
+		{
+			int tx = (int)(CurrentCore.m_Pos.x / 32.0f);
+			int ty = (int)(CurrentCore.m_Pos.y / 32.0f);
+			if(tx >= 0 && tx < m_MapWidth && ty >= 0 && ty < m_MapHeight)
+			{
+				int Tile = pCollision->GetTileIndex(ty * m_MapWidth + tx);
+				int Front = pCollision->GetFrontTileIndex(ty * m_MapWidth + tx);
+				if(Tile == TILE_FREEZE || Front == TILE_FREEZE) IsFrozenLive = true;
+			}
+		}
+
+
+		if(IsFrozenLive || distance(pLocalChar->GetCore().m_Pos, m_LastUpdatePos) < 5.0f)
 			m_StuckCounter++;
 		else
 		{
@@ -1057,24 +1390,27 @@ void CTasBot::OnUpdate()
 			m_LastUpdatePos = pLocalChar->GetCore().m_Pos;
 		}
 
-		if(m_pTasWorld && (m_pTasWorld->IsDeadly() || m_pTasWorld->IsFrozen()))
-		{
-			dbg_msg("tas_bot", "FREEZE/DEATH: Auto-Resetting.");
-			Reward -= 1000.0f;
-			ForceReset = true;
-		}
+		// Phase 20: Start-Area Awareness & Grace Period
+		bool StandingOnStart = false;
+		int TileIdx = pCollision->GetPureMapIndex(pLocalChar->GetCore().m_Pos);
+		if(TileIdx >= 0 && (pCollision->GetTileIndex(TileIdx) == TILE_START || pCollision->GetFrontTileIndex(TileIdx) == TILE_START))
+			StandingOnStart = true;
 
-		if(ForceReset || (g_Config.m_TcTasBotAutoKill && m_StuckCounter > 50 * 5))
+		if(m_StuckCounter > 50 * 3) // 3 Seconds (50Hz)
 		{
-			if(!ForceReset) dbg_msg("tas_bot", "STUCK (5s): Auto-Resetting.");
-			GameClient()->Console()->ExecuteLine("kill", IConsole::CLIENT_ID_GAME);
-			m_StuckCounter = 0;
-			m_LastDist = 0.0f;
+			if (m_TicksSinceSpawn < 150 || StandingOnStart) {
+				m_StuckCounter = 0; // Reset timer, we are either too new or at a safe zone
+			} else {
+				dbg_msg("tas_bot", "STUCK/FREEZE (3s): Auto-Resetting.");
+				GameClient()->Console()->ExecuteLine("say /kill", IConsole::CLIENT_ID_GAME);
+				DumpTelemetry("[STUCK_KILL]", CurrentCore.m_Pos); // Telemetry for stuck kill
+			}
+			m_LiveLastDist = 0.0f;
+		m_DreamLastDist = 0.0f;
 			m_LastUpdatePos = vec2(0,0);
 			m_ActionHoldFrames = 0; 
 			m_Epsilon *= 0.999f; 
 			
-			// Save memory every reset for safety
 			static int s_ResetCounter = 0;
 			if(++s_ResetCounter % 10 == 0) SaveMemory();
 		}
@@ -1082,11 +1418,12 @@ void CTasBot::OnUpdate()
 	else
 	{
 		// Auto-Respawn: If dead, try to kill/jump to come back
-		static int s_RespawnPulse = 0;
-		if(CurrentTick % 100 == 0) // Every 2 seconds
+		if(g_Config.m_TcTasBotAutoKill && CurrentTick % 150 == 0) // Every 3 seconds
 		{
-			dbg_msg("tas_bot", "Character missing: Sending respawn pulse (kill/jump).");
-			GameClient()->Console()->ExecuteLine("kill", IConsole::CLIENT_ID_GAME);
+			// Phase 20: Only pulse if we have been missing for a while (Grace)
+			// (m_TicksSinceSpawn is usually 0 when character is missing)
+			dbg_msg("tas_bot", "Character missing: Sending respawn pulse (say /kill).");
+			GameClient()->Console()->ExecuteLine("say /kill", IConsole::CLIENT_ID_GAME);
 		}
 	}
 	{
@@ -1101,14 +1438,14 @@ void CTasBot::OnRender()
 	// === SAFETY GATE ===
 	if(!GameClient()->Collision() || GameClient()->m_Snap.m_LocalClientId < 0)
 		return;
+		
+	static int s_TraceCounterRender = 0;
+	if (s_TraceCounterRender++ % 100 == 0) dbg_msg("tas_bot_trace", "OnRender Entry");
 
-	// Phase 8: Visualize the Inception Ghost
-	if (g_Config.m_ClTasBotInception)
-	{
+	if(m_InceptionActive)
 		RenderInceptionGhost();
-	}
 
-	// Draw A* Path
+	// Draw A* Path for legacy reference (if exists)
 	if(!m_AStarPath.empty())
 	{
 		Graphics()->TextureClear();
@@ -1145,45 +1482,84 @@ void CTasBot::OnRender()
 			else Graphics()->SetColor(1, 0, 0, 1);
 			IGraphics::CLineItem HookLine(pLocalChar->GetCore().m_Pos.x - 32, pLocalChar->GetCore().m_Pos.y - 55, pLocalChar->GetCore().m_Pos.x + 32, pLocalChar->GetCore().m_Pos.y - 55);
 			Graphics()->LinesDraw(&HookLine, 1);
+			
+			// Phase 14: Flow-Field Direction (Cyan)
+			vec2 Grad = GetFlowGradient(pLocalChar->GetCore().m_Pos);
+			Graphics()->SetColor(0.0f, 1.0f, 1.0f, 0.8f);
+			IGraphics::CLineItem GradLine(pLocalChar->GetCore().m_Pos.x, pLocalChar->GetCore().m_Pos.y, 
+				pLocalChar->GetCore().m_Pos.x + Grad.x * 64.0f, pLocalChar->GetCore().m_Pos.y + Grad.y * 64.0f);
+			Graphics()->LinesDraw(&GradLine, 1);
+			
+			// Phase 14: Hazard Projection (Red Line if dangerous)
+			vec2 FuturePos = pLocalChar->GetCore().m_Pos + (pLocalChar->GetCore().m_Vel * 15.0f * 0.3f);
+			if(GameClient()->Collision()->CheckPoint(FuturePos))
+			{
+				Graphics()->SetColor(1.0f, 0.0f, 0.0f, 1.0f);
+				IGraphics::CLineItem HazLine(pLocalChar->GetCore().m_Pos.x, pLocalChar->GetCore().m_Pos.y, FuturePos.x, FuturePos.y);
+				Graphics()->LinesDraw(&HazLine, 1);
+			}
+			
 			Graphics()->LinesEnd();
 		}
 	}
 }
 
-vec2 CTasBot::FindBestHookTarget(vec2 BotPos, vec2 TargetDir, float Radius)
+vec2 CTasBot::FindBestHookTarget(vec2 BotPos, vec2 IdealDir, float Radius)
 {
 	CCollision *pCollision = GameClient()->Collision();
 	if(!pCollision) return vec2(0, 0);
 
-	int w = pCollision->GetWidth();
-	int h = pCollision->GetHeight();
-	int x0 = std::max(0, (int)(BotPos.x - Radius) / 32);
-	int x1 = std::min(w - 1, (int)(BotPos.x + Radius) / 32);
-	int y0 = std::max(0, (int)(BotPos.y - Radius) / 32);
-	int y1 = std::min(h - 1, (int)(BotPos.y + Radius) / 32);
-
 	vec2 BestTarget(0, 0);
 	float BestValue = -1e9;
-
-	for(int y = y0; y <= y1; y++)
+	
+	// Phase 14: Smart Grapple Sweep (-45 to +45 deg around IdealDir)
+	float BaseAngle = atan2(IdealDir.y, IdealDir.x);
+	for(float AngleOffset = -0.785f; AngleOffset <= 0.785f; AngleOffset += 0.1f) // ~5 deg increments
 	{
-		for(int x = x0; x <= x1; x++)
+		float ScanAngle = BaseAngle + AngleOffset;
+		vec2 ScanDir(cos(ScanAngle), sin(ScanAngle));
+		vec2 To = BotPos + ScanDir * Radius;
+		
+		vec2 OutPos;
+		if(pCollision->IntersectLine(BotPos, To, nullptr, &OutPos))
 		{
-			if(pCollision->IsSolid(x * 32, y * 32))
+			// Check if the tile we hit is actually hookable (Solid and not No-Hook)
+			int tx = (int)(OutPos.x / 32.0f);
+			int ty = (int)(OutPos.y / 32.0f);
+			
+			// Pillar 3: Absolute Bounds Check
+			if(tx < 0 || ty < 0 || tx >= pCollision->GetWidth() || ty >= pCollision->GetHeight())
+				continue;
+
+			int Tile = pCollision->GetTileIndex(ty * pCollision->GetWidth() + tx);
+			int Front = pCollision->GetFrontTileIndex(ty * pCollision->GetWidth() + tx);
+			
+			if(Tile != TILE_NOHOOK && Front != TILE_NOHOOK)
 			{
-				vec2 TilePos(x * 32 + 16, y * 32 + 16);
-				vec2 ToTile = normalize(TilePos - BotPos);
-				float Dist = distance(BotPos, TilePos);
-				
-				// DIRECTIONAL FILTER: Only hook towards the target waypoint
-				if(Dist < Radius && Dist > 64.0f && dot(ToTile, TargetDir) > 0.3f)
+				float Dist = distance(BotPos, OutPos);
+				if(Dist > 64.0f)
 				{
-					// Value: Highest point in the target direction
-					float Val = (BotPos.y - TilePos.y) + dot(ToTile, TargetDir) * 100.0f;
+					// Prefer higher walls and direction alignment
+					float Val = (BotPos.y - OutPos.y) + dot(ScanDir, IdealDir) * 100.0f;
+					
+					// Pillar 3: Hazard Awareness (Freeze adjacency)
+					bool NearFreeze = false;
+					for(int ox = -1; ox <= 1; ox++) {
+						for(int oy = -1; oy <= 1; oy++) {
+							int nx = tx + ox, ny = ty + oy;
+							if(nx < 0 || ny < 0 || nx >= pCollision->GetWidth() || ny >= pCollision->GetHeight()) continue;
+							int t = pCollision->GetTileIndex(ny * pCollision->GetWidth() + nx);
+							int f = pCollision->GetFrontTileIndex(ny * pCollision->GetWidth() + nx);
+							if(t == TILE_FREEZE || f == TILE_FREEZE) { NearFreeze = true; break; }
+						}
+						if(NearFreeze) break;
+					}
+					if(NearFreeze) Val -= 1000.0f; // Strongly discourage
+
 					if(Val > BestValue)
 					{
 						BestValue = Val;
-						BestTarget = TilePos;
+						BestTarget = OutPos;
 					}
 				}
 			}
@@ -1194,134 +1570,224 @@ vec2 CTasBot::FindBestHookTarget(vec2 BotPos, vec2 TargetDir, float Radius)
 
 void CTasBot::OnBeforeInput(CNetObj_PlayerInput *pInput)
 {
-	// === SAFETY GATE: Don't run ANY input logic until game state is fully ready ===
-	if(!GameClient()->Collision() || GameClient()->m_Snap.m_LocalClientId < 0)
+	static int s_TraceCounterInput = 0;
+	if (s_TraceCounterInput++ % 100 == 0) dbg_msg("tas_bot_trace", "OnBeforeInput Entry (Tick %d)", GameClient()->Client()->GameTick(0));
+
+	// === MASTER KILLSWITCH (Phase 20) ===
+	if (!g_Config.m_TcTasBotTraining && !g_Config.m_TcTasBotPlayback && !g_Config.m_ClTasTraining && !g_Config.m_ClTasPlayback)
 		return;
+
+	CCollision *pCollision = GameClient()->Collision();
+	if(!pCollision || GameClient()->m_Snap.m_LocalClientId < 0)
+		return;
+		
+	// Phase 20: Brain Warm-Up. Give reality a head start.
+	if (m_TicksSinceSpawn < 50) {
+		m_TicksSinceSpawn++; // Increment even while waiting
+		return;
+	}
+
+	CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
+	if(pLocalChar)
+	{
+		m_TicksSinceSpawn++; // Grace period tracking (Phase 20)
+		if(m_TicksSinceSpawn < 150) {
+			if(m_TicksSinceSpawn % 50 == 0) dbg_msg("tas_bot", "GRACE PERIOD: Skipping brain for %d ticks...", 150 - m_TicksSinceSpawn);
+			return;
+		}
+	}
 
 	// === SAFETY GATE: Resolve Logic Gate Paradox (V6) ===
 	// Allow processing if either Playback OR Training is active
-	if(!g_Config.m_ClTasPlayback && !m_IsTraining)
+	if(!g_Config.m_ClTasPlayback && !m_IsTraining && !g_Config.m_TcTasBotPlayback)
 	{
 		m_PlaybackTick = 0;
 		return;
 	}
 
-	// Phase 8: Inception Bypass
-	if (g_Config.m_ClTasBotInception && m_InceptionActive)
+	// Phase 48: CENTAUR HYBRID NAVIGATOR V4 (A* + Neural + PE-G)
+	if(g_Config.m_TcBotEnabled)
 	{
-		// Real character stays still on the server while we dream locally
-		mem_zero(pInput, sizeof(CNetObj_PlayerInput));
-		pInput->m_TargetY = -1;
-		return;
-	}
-
-	// Execution logic for true live-server replay with Ping Compensation
-	if(m_IsTraining)
-	{
-		// Avoid Freeze Synergy: Disable normal avoid freeze while AI is training (Modular)
-		if(g_Config.m_TcBotSynergy && m_PrevAvoidFreeze == -1)
-		{
-			m_PrevAvoidFreeze = g_Config.m_TcAvoidFreeze;
-			g_Config.m_TcAvoidFreeze = 0;
-			dbg_msg("tas_bot", "SYNERGY: Disabled global Avoid-Freeze for training.");
-		}
-
-		// Use the REAL-TIME BRAIN to move the character
 		CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
-		
-		// Death detection: Character existed but now is gone
-		static bool s_HadChar = false;
-		if(s_HadChar && !pLocalChar)
-		{
-			// JUST DIED! Save last known position
-			SDeathInfo Death;
-			Death.m_Pos = m_LastStuckPos;
-			Death.m_Tick = Client()->GameTick(g_Config.m_ClDummy);
-			m_DeathMemory.push_back(Death);
-			if(m_DeathMemory.size() > 50) m_DeathMemory.erase(m_DeathMemory.begin());
-			dbg_msg("tas_bot", "LEARNED: Death detected. Added to penalty memory.");
-			
-			// Auto-Kill logic: If stuck for too long, reset to try again
-			if(g_Config.m_TcBotAutoReset) // m_Alive is not a member of CTasBot, using pLocalChar != nullptr instead
-			{
-				m_PlaybackTick = 0; // Restart internal state
-			}
-		}
-		s_HadChar = (pLocalChar != nullptr);
-
 		if(pLocalChar)
 		{
-			m_LastStuckPos = pLocalChar->GetCore().m_Pos;
+			// A. MACRO-NAVIGATOR (A* / Pathfinding)
+			vec2 Target = GetDynamicWaypoint(pLocalChar->m_Pos);
+			float Dist = distance(pLocalChar->m_Pos, Target);
+			m_LastDistToGoal = Dist; // Sync for Telemetry
 			
-			// Auto-Kill logic: If stuck for too long, reset to try again
-			if(g_Config.m_TcBotAutoReset && pLocalChar)
+			// B. STABILITY NODE (User Request: Stand Still)
+			if (Dist < 24.0f && length(pLocalChar->m_Core.m_Vel) < 1.0f)
 			{
-				if(length(pLocalChar->GetCore().m_Vel) < 0.1f)
-					m_StuckTicks++;
-				else
-					m_StuckTicks = 0;
-
-				if(m_StuckTicks > 300) // 6 seconds
-				{
-					dbg_msg("tas_bot", "STUCK detected! Sending KILL to reset.");
-					GameClient()->SendKill();
-					m_StuckTicks = 0;
-				}
-			}
-
-			*pInput = GetBestLiveInput(pLocalChar->GetCore());
-		}
-		return;
-	}
-	else if(m_PrevAvoidFreeze != -1)
-	{
-		// Restore normal avoid freeze when training stops (Modular)
-		if(g_Config.m_TcBotSynergy)
-		{
-			g_Config.m_TcAvoidFreeze = m_PrevAvoidFreeze;
-			m_PrevAvoidFreeze = -1;
-			dbg_msg("tas_bot", "SYNERGY: Restored global Avoid-Freeze.");
-		}
-	}
-
-	if(m_HasMasterRun && !m_IsTraining) 
-	{
-		if(m_PlaybackTick >= 0 && m_PlaybackTick < (int)m_MasterRun.size() && m_PlaybackTick < (int)m_MasterRunPositions.size())
-		{
-			CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
-			if(!pLocalChar) {
-				// No debug message here to avoid spamming the console 50 times/sec
-				return;
-			}
-			
-			vec2 CurrentPos = pLocalChar->GetCore().m_Pos;
-			vec2 ExpectedPos = m_MasterRunPositions[m_PlaybackTick];
-			
-			// Calculate distance between where we are and where the TAS says we should be
-			float Dist = distance(CurrentPos, ExpectedPos);
-			
-			// Tolerance check (30.0f is roughly 1 tile radius)
-			if(Dist < 30.0f)
-			{
-				// In sync! Execute the planned input for this tick
-				*pInput = m_MasterRun[m_PlaybackTick];
-				m_PlaybackTick++;
+				pInput->m_Direction = 0;
+				pInput->m_Jump = 0;
+				pInput->m_Hook = 0;
 			}
 			else
 			{
-				// Out of sync! (Lag spike or misprediction from server)
-				// Do NOT increment the playback tick. Wait for the character to physically arrive.
-				// Keep holding the previous input to maintain momentum.
-				*pInput = m_MasterRun[std::max(0, m_PlaybackTick - 1)];
+				// C. NEURAL MICRO-REFLEX
+				RunNeuralForwardPass();
 				
-				// Optional: We could trigger CAvoidFreeze here for extreme safety
+				// D. HYBRID MERGE
+				pInput->m_Direction = (Target.x > pLocalChar->m_Pos.x) ? 1 : -1;
+				pInput->m_Jump = (m_NeuralOutput[0] > 0.5f) ? 1 : 0;
+				pInput->m_Hook = (m_NeuralOutput[1] > 0.5f) ? 1 : 0;
 			}
+			
+			// E. SSAS EXPORT (PE-G Optimized telemetry)
+			ExportNeuralState(1.0f / (1.0f + Dist));
 		}
-		else
+		return;
+	}
+}
+
+void CTasBot::RenderInceptionGhost()
+{
+	if (!m_InceptionActive) return;
+
+	CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
+	if (!pLocalChar) return;
+
+	CTeeRenderInfo RenderInfo = GameClient()->m_aClients[GameClient()->m_Snap.m_LocalClientId].m_RenderInfo;
+	for(int i = 0; i < 6; i++) RenderInfo.m_aSixup[0].m_aColors[i].a *= 0.5f; // 50% Alpha Ghost
+
+	// Create a stable animation state for the ghost (Base pose) to avoid nullptr crash
+	CAnimState Anim;
+	Anim.Set(&g_pData->m_aAnimations[ANIM_BASE], 0.0f);
+
+	// Explicitly render the ghost tee
+	RenderTools()->RenderTee(&Anim, &RenderInfo, 0, vec2(1, 0), m_SimulatedCore.m_Pos);
+
+	// Phase 10/11: Render Flow-Field Gradient Line (Cyan)
+	vec2 Grad = GetFlowGradient(m_SimulatedCore.m_Pos);
+	Graphics()->TextureClear();
+	Graphics()->LinesBegin();
+	Graphics()->SetColor(0.0f, 1.0f, 1.0f, 0.6f); 
+	IGraphics::CLineItem Line(m_SimulatedCore.m_Pos.x, m_SimulatedCore.m_Pos.y, 
+		m_SimulatedCore.m_Pos.x + Grad.x * 64.0f, m_SimulatedCore.m_Pos.y + Grad.y * 64.0f);
+	Graphics()->LinesDraw(&Line, 1);
+	Graphics()->LinesEnd();
+}
+
+void CTasBot::DumpTelemetry(const char *Tag, vec2 Pos)
+{
+	if (!g_Config.m_TcBotLogging) return;
+	
+	char aBuf[256];
+	if (str_comp(Tag, "[HEARTBEAT]") == 0)
+	{
+		str_format(aBuf, sizeof(aBuf), "%s Dist: %.2f Pos: %.1f, %.1f", Tag, m_LastDistToGoal, Pos.x, Pos.y);
+	}
+	else
+	{
+		str_format(aBuf, sizeof(aBuf), "%s Pos: %.1f, %.1f", Tag, Pos.x, Pos.y);
+	}
+	
+	// Direct append to telemetry log
+	IOHANDLE File = io_open("tas_telemetry_matrix.log", IOFLAG_APPEND);
+	if(File)
+	{
+		io_write(File, aBuf, str_length(aBuf));
+		io_write(File, "\n", 1);
+		io_close(File);
+	}
+}
+
+void CTasBot::LoadTraumaMap()
+{
+	m_TraumaMap.clear();
+	
+	std::ifstream f("trauma_map.json");
+	if (!f.is_open()) return;
+	
+	std::string line;
+	while (std::getline(f, line))
+	{
+		// Simple pattern matching for {"x": X, "y": Y, "deaths": D}
+		// Since we generate this via Python, it will be standard.
+		int x, y, deaths;
+		if (sscanf(line.c_str(), " {\"x\": %d, \"y\": %d, \"deaths\": %d}", &x, &y, &deaths) == 3 ||
+		    sscanf(line.c_str(), "{\"x\": %d, \"y\": %d, \"deaths\": %d}", &x, &y, &deaths) == 3)
 		{
-			g_Config.m_ClTasPlayback = 0;
-			dbg_msg("tas_bot", "Playback finished.");
+			int tileIdx = y * m_MapWidth + x;
+			m_TraumaMap[tileIdx] = deaths;
 		}
+	}
+	f.close();
+	
+	if (!m_TraumaMap.empty())
+		dbg_msg("tas_bot", "Phase 22: Trauma Map loaded with %d hotspots.", (int)m_TraumaMap.size());
+}
+
+
+void CTasBot::UpdateTapMatrix(vec2 Pos, vec2 Vel, float Trauma) {
+	m_TapMatrix.push_back({Pos, Vel, Trauma});
+	if (m_TapMatrix.size() > 5000) m_TapMatrix.erase(m_TapMatrix.begin());
+}
+
+float CTasBot::GetPhaseSpaceTrauma(vec2 Pos, vec2 Vel) {
+	float total = 0.0f;
+	for (auto& e : m_TapMatrix) {
+		float d = distance(Pos, e.m_Pos);
+		if (d < 128.0f) {
+			float align = 0.0f;
+			if (length(Vel) > 0.1f && length(e.m_Vel) > 0.1f)
+				align = std::max(0.0f, dot(normalize(Vel), normalize(e.m_Vel)));
+			float spatial = exp(-(d*d) / (2.0f * 64.0f * 64.0f));
+			total += e.m_Factor * spatial * (0.5f + 0.5f * align);
+		}
+	}
+	return total;
+}
+
+void CTasBot::RunNeuralForwardPass() {
+	CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
+	if (!pLocalChar) return;
+
+	// Phase 44: Curiosity Entropy Injection (Anti-Loop)
+	static vec2 LastPosForEntropy = {0,0};
+	static int LoopCounter = 0;
+	if (distance(pLocalChar->m_Pos, LastPosForEntropy) < 0.1f) LoopCounter++;
+	else LoopCounter = 0;
+	LastPosForEntropy = pLocalChar->m_Pos;
+
+	// Layer 1: Forward Pass (ReLU)
+	float h1[8] = {0};
+	for (int i = 0; i < 8; i++) {
+		for (int j = 0; j < 5; j++) h1[i] += m_NeuralInput[j] * Synapse::W1[i][j];
+		// Entropy Injection if stuck
+		if (LoopCounter > 500) h1[i] += (rand() % 100) / 50.0f - 1.0f; 
+		h1[i] = std::max(0.0f, h1[i] + Synapse::B1[i]);
+	}
+	
+	// Layer 2: Output Pass (Tanh-ish approx)
+	for (int i = 0; i < 2; i++) {
+		m_NeuralOutput[i] = 0.0f;
+		for (int j = 0; j < 8; j++) m_NeuralOutput[i] += h1[j] * Synapse::W2[i][j];
+		m_NeuralOutput[i] += Synapse::B2[i];
+	}
+}
+
+void CTasBot::ExportNeuralState(float Reward) {
+	if (!g_Config.m_TcBotLogging) return;
+	
+	CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
+	if (!pLocalChar) return;
+
+	char aBuf[512];
+	str_format(aBuf, sizeof(aBuf), 
+		"{\"s\": [%.1f, %.1f, %.2f, %.2f, %.2f], \"a\": [%d, %d], \"r\": %.3f}", 
+		pLocalChar->m_Pos.x, pLocalChar->m_Pos.y, 
+		pLocalChar->m_Core.m_Vel.x, pLocalChar->m_Core.m_Vel.y,
+		m_LastDistToGoal, 
+		m_LastInput.m_Direction, m_LastInput.m_Jump,
+		Reward);
+
+	IOHANDLE File = io_open("swarm_experience.jsonl", IOFLAG_APPEND);
+	if(File) {
+		io_write(File, aBuf, str_length(aBuf));
+		io_write(File, "\n", 1);
+		io_close(File);
 	}
 }
 
@@ -1334,13 +1800,11 @@ void CTasBot::SaveTasRun(const char *pFileName)
 	IOHANDLE File = Storage()->OpenFile(aBuf, IOFLAG_WRITE, IStorage::TYPE_SAVE);
 	if(!File) return;
 
-	// Write header (version, count)
 	int Version = 1;
 	io_write(File, &Version, sizeof(int));
 	int Count = (int)m_MasterRun.size();
 	io_write(File, &Count, sizeof(int));
 
-	// Write inputs and positions
 	io_write(File, m_MasterRun.data(), sizeof(CNetObj_PlayerInput) * Count);
 	io_write(File, m_MasterRunPositions.data(), sizeof(vec2) * m_MasterRunPositions.size());
 
@@ -1370,7 +1834,6 @@ void CTasBot::LoadTasRun(const char *pFileName)
 	io_read(File, m_MasterRun.data(), sizeof(CNetObj_PlayerInput) * Count);
 	io_read(File, m_MasterRunPositions.data(), sizeof(vec2) * Count);
 
-	// Final verification: ensure both contain the same amount of data
 	if(m_MasterRun.size() != m_MasterRunPositions.size())
 	{
 		m_MasterRun.clear();
@@ -1399,7 +1862,7 @@ void CTasBot::ResetInception()
 		m_InceptionResetPos = vec2(0, 0);
 	}
 	
-	m_SimulatedCore.m_Id = 0; // Local ID for sim
+	m_SimulatedCore.m_Id = 0; 
 	m_SimulatedCore.SetCoreWorld(&m_SimulatedWorld, GameClient()->Collision(), &GameClient()->m_Teams);
 	m_SimulatedWorld.m_apCharacters[0] = &m_SimulatedCore;
 
@@ -1408,143 +1871,45 @@ void CTasBot::ResetInception()
 	m_TotalTicksSimulated = 0;
 	m_LastAITick = -1;
 	m_PreviousHorizontalVel = 0.0f;
+	
+	m_CurrentEpisodeTicks = 0;
+	m_TicksSinceSpawn = 0;
+	m_RecentTiles.clear();
+	m_EpisodeHistory.clear();
 }
 
 void CTasBot::RunInceptionTick()
 {
 	if (!g_Config.m_ClTasTraining) return;
+	CCollision *pCollision = GameClient()->Collision();
+	if(!pCollision) return;
 
-	// 1. Get current state
-	vec2 DynamicWaypoint = GetDynamicWaypoint(m_SimulatedCore.m_Pos);
-	uint64_t State = GetStateHash(m_SimulatedCore, DynamicWaypoint);
-
-	// 2. Choose Action (Epsilon-Greedy)
-	int Action;
-	if ((rand() % 100) < (int)(m_Epsilon * 100))
-		Action = rand() % 8;
-	else
-	{
-		float MaxQ = -1e9;
-		Action = 0;
-		for (int a = 0; a < 8; ++a) {
-			if (m_QTable[State][a] > MaxQ) {
-				MaxQ = m_QTable[State][a];
-				Action = a;
-			}
-		}
+	if (!m_SimulatedCore.Collision()) {
+		ResetInception();
+		if (!m_SimulatedCore.Collision()) return;
 	}
 
-	// 3. Map Action to Input
-	CNetObj_PlayerInput Input = MapActionToInput(Action, m_SimulatedCore, DynamicWaypoint);
+	uint64_t State = GetStateHash(m_SimulatedCore);
+	m_CurrentEpisodeTicks++;
+	m_TicksSinceSpawn++; 
+
+	int CurrentTileIdx = pCollision->GetPureMapIndex(m_SimulatedCore.m_Pos);
+	if (m_RecentTiles.empty() || m_RecentTiles.back() != CurrentTileIdx) {
+		m_RecentTiles.push_back(CurrentTileIdx);
+		if (m_RecentTiles.size() > 10) m_RecentTiles.pop_front();
+	}
+
+	int Action = 0; // Simplified for restoration
+	vec2 TargetPos = m_SimulatedCore.m_Pos + GetFlowGradient(m_SimulatedCore.m_Pos) * 100.0f;
+	CNetObj_PlayerInput Input = MapActionToInput(Action, m_SimulatedCore, TargetPos);
 	
-	// FIX: Ensure hook has target
-	if (Input.m_Hook)
-	{
-		if (Input.m_TargetX == 0 && Input.m_TargetY == 0)
-			Input.m_TargetY = -1;
-	}
-
-	// 4. Step Physics (Simulated)
 	m_SimulatedCore.m_Input = Input;
 	m_SimulatedCore.Tick(true, true);
 	m_SimulatedCore.Move();
 	m_SimulatedCore.Quantize();
 
-	// 5. Evaluate Reward
-	float Reward = -1.0f; // Time penalty
-	
-	// Distance reward
-	float Dist = distance(m_SimulatedCore.m_Pos, DynamicWaypoint);
-	if (Dist < m_LastDist) Reward += 10.0f; // Increased for faster convergence
-	m_LastDist = Dist;
-
-	// Tarzan Reward (Momentum bonus)
-	if (absolute(m_SimulatedCore.m_Vel.x) > absolute(m_PreviousHorizontalVel))
-		Reward += 5.0f;
-	m_PreviousHorizontalVel = m_SimulatedCore.m_Vel.x;
-
-	// Failure Check (Inception Reset)
-	bool Failed = false;
-	int Tile = GameClient()->Collision()->GetTile(round_to_int(m_SimulatedCore.m_Pos.x), round_to_int(m_SimulatedCore.m_Pos.y));
-	int Front = GameClient()->Collision()->GetFrontTile(round_to_int(m_SimulatedCore.m_Pos.x), round_to_int(m_SimulatedCore.m_Pos.y));
-
-	if (Tile == TILE_DEATH || Front == TILE_DEATH)
-		Failed = true;
-	if (m_SimulatedCore.m_IsInFreeze)
-		Failed = true;
-	
-	if (Failed)
-	{
-		Reward = -5000.0f; // Heavier penalty
-		UpdateQValue(State, Action, Reward, State);
-		ResetInception();
-		return;
-	}
-
-	// Success Check
-	if (Dist < 48.0f)
-	{
-		Reward = 2000.0f;
-		UpdateQValue(State, Action, Reward, State);
-		// Don't reset, just keep going to next waypoint
-	}
-
-	// 6. Update Q-Table
-	uint64_t NextState = GetStateHash(m_SimulatedCore, DynamicWaypoint);
-	UpdateQValue(State, Action, Reward, NextState);
-
+	uint64_t NextState = GetStateHash(m_SimulatedCore);
 	m_TotalTicksSimulated++;
-	
-	// Epsilon Decay (Episode-based)
-	if (m_TotalTicksSimulated % 10000 == 0 && m_Epsilon > 0.05f)
-		m_Epsilon -= 0.01f;
 }
 
-void CTasBot::RenderInceptionGhost()
-{
-	if (!m_InceptionActive) return;
-
-	// Use the local player's render info but modify for ghosting
-	CCharacter *pLocalChar = GameClient()->m_PredictedWorld.GetCharacterById(GameClient()->m_Snap.m_LocalClientId);
-	if (!pLocalChar) return;
-
-	CTeeRenderInfo RenderInfo = GameClient()->m_aClients[GameClient()->m_Snap.m_LocalClientId].m_RenderInfo;
-	
-	// Create a dummy character object for the renderer
-	CNetObj_Character GhostChar;
-	mem_zero(&GhostChar, sizeof(GhostChar));
-	
-	CNetObj_CharacterCore GhostCore;
-	m_SimulatedCore.Write(&GhostCore);
-	
-	// Manually sync core fields (Safe bypass for flat protocol structs)
-	GhostChar.m_X = GhostCore.m_X;
-	GhostChar.m_Y = GhostCore.m_Y;
-	GhostChar.m_VelX = GhostCore.m_VelX;
-	GhostChar.m_VelY = GhostCore.m_VelY;
-	GhostChar.m_Angle = GhostCore.m_Angle;
-	GhostChar.m_Direction = GhostCore.m_Direction;
-	GhostChar.m_Jumped = GhostCore.m_Jumped;
-	GhostChar.m_HookState = GhostCore.m_HookState;
-	GhostChar.m_HookTick = GhostCore.m_HookTick;
-	GhostChar.m_HookX = GhostCore.m_HookX;
-	GhostChar.m_HookY = GhostCore.m_HookY;
-	
-	// Visual adjustments to distinguish the "Dream Tee"
-	// We use ClientId = -2 to trigger the Ghost Alpha in players.cpp
-	GameClient()->m_Players.RenderPlayer(
-		&GhostChar, &GhostChar, 
-		&RenderInfo, 
-		-2, // Ghost ID
-		0.0f
-	);
-
-	// Optional: Render a line to the current target
-	vec2 DynamicWaypoint = GetDynamicWaypoint(m_SimulatedCore.m_Pos);
-	Graphics()->TextureClear();
-	Graphics()->LinesBegin();
-	Graphics()->SetColor(0.0f, 1.0f, 0.0f, 0.3f);
-	IGraphics::CLineItem Line(m_SimulatedCore.m_Pos.x, m_SimulatedCore.m_Pos.y, DynamicWaypoint.x, DynamicWaypoint.y);
-	Graphics()->LinesDraw(&Line, 1);
-	Graphics()->LinesEnd();
-}
+void CTasBot::ResetInception(vec2 Pos) { ResetInception(); m_SimulatedCore.m_Pos = Pos; }

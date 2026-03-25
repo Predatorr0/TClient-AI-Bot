@@ -145,22 +145,44 @@ std::vector<vec2> CAStarPathfinder::FindPath(vec2 StartPos, vec2 GoalPos)
 			// Phase 7: Physics-Aware Costing (Gravity & Hook Bias)
 			float MoveCost = (i < 4) ? 1.0f : 1.414f;
 			
-			// Gravity Bias: Moving UP (ny < Current.m_Y) is harder
-			if(ny < Current.m_Y)
+			// Phase 9: True-Platformer Cost logic
+			if(ny < Current.m_Y) // Moving UP
 			{
-				bool HookableAbove = false;
-				for(int ay = -1; ay >= -4; ay--) // Look up for hookable ceiling
+				int dy = Current.m_Y - ny;
+				if(dy > 2) // Higher than a standard double jump
 				{
-					if(m_pCollision->IsSolid(nx * 32 + 16, (ny + ay) * 32 + 16)) {
-						HookableAbove = true;
-						break;
+					bool HookableAbove = false;
+					for(int ay = -1; ay >= -12; ay--) // Look up 12 tiles for hookable ceiling
+					{
+						int tx = nx;
+						int ty = ny + ay;
+						if(tx >= 0 && tx < m_Width && ty >= 0 && ty < m_Height)
+						{
+							int Index = ty * m_Width + tx;
+							if(m_pCollision->IsSolid(tx * 32 + 16, ty * 32 + 16))
+							{
+								int Tile = m_pCollision->GetTileIndex(Index);
+								int Front = m_pCollision->GetFrontTileIndex(Index);
+								if(Tile != TILE_NOHOOK && Front != TILE_NOHOOK)
+								{
+									HookableAbove = true;
+									break;
+								}
+							}
+						}
 					}
+					if(!HookableAbove) MoveCost = 99999.0f; // Unreachable vertically
+					else MoveCost = 5.0f;
 				}
-				if(!HookableAbove) MoveCost *= 10.0f; // Massive penalty for floating up
+				else MoveCost = 2.0f; // Small jump/climb
 			}
 			else if(ny > Current.m_Y)
 			{
-				MoveCost *= 0.8f; // Fall discount
+				MoveCost = 1.0f; // Falling is easy
+			}
+			else
+			{
+				MoveCost = 2.0f; // Horizontal
 			}
 
 			float NewG = Current.m_G + MoveCost;

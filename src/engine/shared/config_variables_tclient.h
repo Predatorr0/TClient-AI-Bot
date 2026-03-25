@@ -306,6 +306,9 @@ MACRO_CONFIG_INT(TcBotSynergy, tc_bot_synergy, 1, 0, 1, CFGFLAG_CLIENT | CFGFLAG
 MACRO_CONFIG_INT(TcBotDDRaceAware, tc_bot_ddrace_aware, 1, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Enable DDRace entity awareness in AI pathing/evaluation")
 
 MACRO_CONFIG_INT(TcTasBotAutoKill, tc_tas_bot_auto_kill, 1, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Enable/Disable automatic suicide when stuck")
+MACRO_CONFIG_INT(TcTasInceptionSpeed, tc_tas_inception_speed, 200, 1, 1000, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Simulation speed for Inception mode (Dream World)")
+MACRO_CONFIG_INT(TcTasBotPlayback, tc_tas_bot_playback, 0, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Enable AI Brain-linked Playback (Reality Execution)")
+MACRO_CONFIG_INT(TcTasBotTraining, tc_tas_bot_training, 0, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Enable AI Brain Training")
 
 // Client Spoofer
 MACRO_CONFIG_INT(TcSpoofer, tc_spoofer, 0, 0, 1, CFGFLAG_CLIENT | CFGFLAG_SAVE, "Spoof client identity to server (0=off, 1=on)")
