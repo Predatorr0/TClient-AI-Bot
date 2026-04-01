@@ -43,4 +43,4 @@ Final hardening. Implementation of the **Sovereign Sync** (Seqlock) and **Risk S
 2. **Launch Client**: `./DDNet.exe` (Ensure `cl_tas_playback 2` for LPSD mode).
 3. **Launch Brain**: `python Global_AI_Toolkit/diffuser.py` (Requires PyTorch).
 
-*Architected by Antigravity AI* 🏛️🛡️
+*Architected by Lexzyy* 🏛️🛡️
